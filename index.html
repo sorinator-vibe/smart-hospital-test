@@ -3332,6 +3332,337 @@ window.HOSP = window.HOSP || {};
 })(window.HOSP);
 
 </script>
+<script>
+/* liftcore.js — Elevator Core E: the surgical floor's vertical connection.
+   Four cars on the lobby face of the core, modelled on hospital service / passenger
+   elevators of the Otis Gen2–Gen3 class: two BED lifts (1.6 m clear doors, 2.0 × 3.0 m
+   cars for a porter with an ALTA transfer platform or a stretcher) and two PASSENGER
+   lifts (1.1 m doors) for staff, ambulatory patients and wheelchair rides. Hall
+   fixtures follow current hospital practice: a warm, light LCD position indicator with
+   a directional lantern over every door, illuminated hall-call plates on the jamb,
+   destination-dispatch kiosk (Otis Compass-style) in the lobby, stainless sills, and
+   crash rails at bed height. Door motion, lanterns and car arrival are driven live by
+   the traffic below.
+
+   Traffic through the core (all scripted here, collision-registered with AGENTS):
+   • wheelchair discharge rides from the care fleet board a passenger lift and ride up;
+     the chair returns empty a little later and heads back to base;
+   • ALTA-05 brings admissions down on a bed lift, settles them in a pre-op bay, collects
+     a post-op patient from PACU and rides back up to the ward;
+   • staff and ambulatory patients arrive and depart through the passenger lifts;
+   • a cross-floor supply AMR rides the second bed lift with a case cart.
+
+   Exposes window.LIFTS { request(id, open), isOpen(id), carX(id), doorX, lifts }. */
+(function () {
+  'use strict';
+  const H = window.HOSP;
+  const FACE_X = 53.5;                 // lobby face of Core E (doors sit here, facing west); corridor from the OR end wall is 6.5 m
+  const LIFTS = {
+    defs: [
+      { id: 'B1', kind: 'bed', z: -5.2, label: 'Bed lift B1', floor: 4 },
+      { id: 'B2', kind: 'bed', z: -1.7, label: 'Bed lift B2', floor: 4 },
+      { id: 'P1', kind: 'pax', z: 2.2, label: 'Passenger P1', floor: 4 },
+      { id: 'P2', kind: 'pax', z: 5.0, label: 'Passenger P2', floor: 4 },
+    ],
+    byId: {}, doorX: FACE_X, lobbyX: 50.25, traffic: [], metrics: { rides: 0, boarded: 0 },
+    request(id, open) { const L = this.byId[id]; if (L) L.extWant = open ? 1 : 0; },
+    isOpen(id) { const L = this.byId[id]; return L ? L.k > 0.92 : false; },
+    carX(id) { return FACE_X + 2.2; },
+    car(id) { const L = this.byId[id]; return L ? { x: FACE_X + 2.2, z: L.z } : null; },
+  };
+  window.LIFTS = LIFTS;
+
+  // ---------- materials ----------
+  function mat(c, r, m, extra) { const x = new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: r == null ? 0.6 : r, metalness: m || 0 }, extra || {})); x.userData.__sat = true; return x; }
+  const M = {
+    wall: () => mat(0xeef0f3, 0.72, 0.03), steel: () => mat(0xdfe3e8, 0.3, 0.55), steel2: () => mat(0xc5cad1, 0.36, 0.5),
+    dark: () => mat(0x1f2328, 0.5, 0.3), glass: () => mat(0x0f1318, 0.2, 0.5), rail: () => mat(0xe3e6ea, 0.6, 0.08),
+    led: (c, i) => { const m = mat(0x101418, 0.4, 0.1); m.emissive = new THREE.Color(c); m.emissiveIntensity = i == null ? 1 : i; return m; },
+  };
+  function rbox(w, h, d, r, m) {
+    const hw0 = w / 2, hd0 = d / 2, rr0 = Math.max(0.002, Math.min(r, hw0 - 0.002, hd0 - 0.002));
+    const bt = Math.min(0.02, h * 0.24, rr0 * 0.7, hw0 * 0.45, hd0 * 0.45);
+    const hw = hw0 - bt, hd = hd0 - bt, rr = Math.max(0.001, rr0 - bt);
+    const s = new THREE.Shape();
+    s.moveTo(-hw + rr, -hd); s.lineTo(hw - rr, -hd); s.quadraticCurveTo(hw, -hd, hw, -hd + rr); s.lineTo(hw, hd - rr); s.quadraticCurveTo(hw, hd, hw - rr, hd);
+    s.lineTo(-hw + rr, hd); s.quadraticCurveTo(-hw, hd, -hw, hd - rr); s.lineTo(-hw, -hd + rr); s.quadraticCurveTo(-hw, -hd, -hw + rr, -hd);
+    const geo = new THREE.ExtrudeGeometry(s, { depth: Math.max(0.001, h - 2 * bt), bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelSegments: 2, curveSegments: 6 });
+    geo.rotateX(-Math.PI / 2); geo.translate(0, bt - h / 2, 0);
+    const o = new THREE.Mesh(geo, m); o.castShadow = true; o.receiveShadow = true; return o;
+  }
+  function box(w, h, d, m) { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.castShadow = true; return o; }
+  function cyl(r1, r2, h, seg, m) { return new THREE.Mesh(new THREE.CylinderGeometry(r1, r2, h, seg), m); }
+  function cv(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+  // ---------- warm hall display (position indicator + lantern) ----------
+  function hallDisplay(L) {
+    const c = cv(384, 192), x = c.getContext('2d');
+    const tex = new THREE.CanvasTexture(c); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = 4;
+    function draw(floor, dir, arriving) {
+      x.fillStyle = '#f6f1ea'; x.fillRect(0, 0, 384, 192);
+      x.fillStyle = '#e8e1d8'; x.fillRect(0, 160, 384, 32);
+      x.fillStyle = '#6e6e73'; x.font = '500 20px Carlito, Barlow, sans-serif'; x.fillText(L.label, 20, 182);
+      x.fillStyle = arriving ? '#1d7a3e' : '#1d1d1f'; x.font = '600 108px Lora, Georgia, serif'; x.textAlign = 'center'; x.fillText(String(floor), 150, 126); x.textAlign = 'left';
+      x.fillStyle = dir === 0 ? '#c9c4bd' : '#1b4fa6';
+      x.beginPath();
+      if (dir >= 0) { x.moveTo(290, 46); x.lineTo(326, 92); x.lineTo(254, 92); } else { x.moveTo(290, 100); x.lineTo(326, 54); x.lineTo(254, 54); }
+      x.closePath(); x.fill();
+      if (arriving) { x.fillStyle = '#1d7a3e'; x.font = '600 20px Carlito, Barlow, sans-serif'; x.textAlign = 'center'; x.fillText('Car here', 290, 140); x.textAlign = 'left'; }
+      else { x.fillStyle = '#9a948c'; x.font = '400 18px Carlito, Barlow, sans-serif'; x.textAlign = 'center'; x.fillText(dir === 0 ? 'Idle' : (dir > 0 ? 'Going up' : 'Going down'), 290, 140); x.textAlign = 'left'; }
+      tex.needsUpdate = true;
+    }
+    draw(L.floor, 0, false);
+    const grp = new THREE.Group();
+    const bezel = rbox(0.06, 0.34, 0.66, 0.03, M.dark()); grp.add(bezel);
+    const face = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.3), new THREE.MeshBasicMaterial({ map: tex })); face.rotation.y = -Math.PI / 2; face.position.x = -0.032; grp.add(face);
+    return { group: grp, draw };
+  }
+
+  // ---------- one hoistway + hall fixtures (doors face −x, car to +x) ----------
+  function makeLift(def) {
+    const bed = def.kind === 'bed';
+    const W = bed ? 3.0 : 2.2, DEPTH = bed ? 3.4 : 2.6, HT = 3.2, DOOR = bed ? 1.6 : 1.1, DH = bed ? 2.3 : 2.2;
+    const g = new THREE.Group(); g.position.set(FACE_X, 0, def.z);
+    const wall = M.wall(), steel = M.steel(), steel2 = M.steel2(), dark = M.dark();
+    // hoistway as walls (car visible when open)
+    const back = rbox(0.12, HT, W, 0.02, wall); back.position.set(DEPTH - 0.06, HT / 2, 0); g.add(back);
+    for (const sz of [-1, 1]) { const side = rbox(DEPTH, HT, 0.12, 0.02, wall); side.position.set(DEPTH / 2, HT / 2, sz * (W / 2 - 0.06)); g.add(side); }
+    const roof = rbox(DEPTH, 0.12, W, 0.02, wall); roof.position.set(DEPTH / 2, HT - 0.06, 0); g.add(roof);
+    const lintel = rbox(0.12, HT - DH - 0.3, W, 0.02, wall); lintel.position.set(0.06, DH + 0.3 + (HT - DH - 0.3) / 2, 0); g.add(lintel);
+    for (const sz of [-1, 1]) { const pw = (W - DOOR) / 2 - 0.12; const pier = rbox(0.12, DH + 0.3, pw, 0.02, wall); pier.position.set(0.06, (DH + 0.3) / 2, sz * (DOOR / 2 + 0.12 + pw / 2)); g.add(pier); }
+    // jambs, header, sill — satin stainless
+    for (const sz of [-1, 1]) { const j = rbox(0.1, DH, 0.12, 0.015, steel); j.position.set(-0.03, DH / 2, sz * (DOOR / 2 + 0.06)); g.add(j); }
+    const header = rbox(0.1, 0.26, DOOR + 0.24, 0.015, steel); header.position.set(-0.03, DH + 0.13, 0); g.add(header);
+    const sill = rbox(0.4, 0.02, DOOR + 0.2, 0.01, steel2); sill.position.set(-0.1, 0.02, 0); g.add(sill);
+    // two-speed centre-opening doors
+    const leafW = DOOR / 2 + 0.04;
+    const leaves = [];
+    for (const side of [-1, 1]) {
+      const fast = rbox(0.04, DH - 0.04, leafW, 0.01, steel); fast.position.set(0.0, DH / 2, side * leafW / 2); g.add(fast);
+      const slow = rbox(0.04, DH - 0.04, leafW, 0.01, steel2); slow.position.set(0.06, DH / 2, side * leafW / 2); slow.visible = false; g.add(slow);
+      const seam = rbox(0.045, DH - 0.1, 0.01, 0.003, dark); seam.position.set(0, DH / 2, side * 0.006); g.add(seam);
+      leaves.push({ side, fast, slow, seam });
+    }
+    const setOpen = (k) => {
+      k = Math.max(0, Math.min(1, k));
+      for (const L of leaves) {
+        L.fast.position.z = L.side * (leafW / 2 + k * (leafW + 0.02));
+        L.slow.visible = k > 0.03; L.slow.position.z = L.side * (leafW / 2 + k * (leafW * 0.5));
+        L.seam.position.z = L.side * (0.006 + k * (leafW + 0.02));
+      }
+    };
+    setOpen(0);
+    // car interior
+    const carW = W - 0.5, carD = DEPTH - 0.5;
+    const floor = rbox(carD, 0.03, carW, 0.01, mat(0x3a3f46, 0.9, 0.05)); floor.position.set(DEPTH / 2 + 0.1, 0.04, 0); g.add(floor);
+    const carBack = rbox(0.05, DH, carW, 0.01, mat(0xdcdfe3, 0.35, 0.6)); carBack.position.set(DEPTH - 0.2, DH / 2, 0); g.add(carBack);
+    for (const sz of [-1, 1]) { const sw = rbox(carD, DH, 0.05, 0.01, mat(0xdcdfe3, 0.35, 0.6)); sw.position.set(DEPTH / 2 + 0.1, DH / 2, sz * carW / 2); g.add(sw); }
+    const ceiling = rbox(carD, 0.04, carW, 0.01, M.led(0xfff3e4, 0.5)); ceiling.position.set(DEPTH / 2 + 0.1, DH - 0.02, 0); g.add(ceiling);
+    const handrail = cyl(0.02, 0.02, carW - 0.2, 10, steel); handrail.rotation.x = Math.PI / 2; handrail.position.set(DEPTH - 0.26, 0.9, 0); g.add(handrail);
+    if (bed) for (const sz of [-1, 1]) { const bump = rbox(carD - 0.2, 0.12, 0.04, 0.01, mat(0x2b2f36, 0.7, 0.1)); bump.position.set(DEPTH / 2 + 0.1, 0.42, sz * (carW / 2 - 0.04)); g.add(bump); }
+    const cop = rbox(0.02, 0.5, 0.14, 0.01, steel); cop.position.set(0.3, 1.2, carW / 2 - 0.02); g.add(cop);
+    // hall display + lantern over the door
+    const disp = hallDisplay(def); disp.group.position.set(-0.06, DH + 0.56, 0); g.add(disp.group);
+    // hall-call plate on the right jamb side
+    const plate = rbox(0.02, 0.3, 0.12, 0.01, steel); plate.position.set(-0.07, 1.05, DOOR / 2 + 0.3); g.add(plate);
+    const btnUp = cyl(0.028, 0.028, 0.015, 14, M.led(0x3a4049, 0.15)); btnUp.rotation.z = Math.PI / 2; btnUp.position.set(-0.085, 1.12, DOOR / 2 + 0.3); g.add(btnUp);
+    const btnDn = cyl(0.028, 0.028, 0.015, 14, M.led(0x3a4049, 0.15)); btnDn.rotation.z = Math.PI / 2; btnDn.position.set(-0.085, 0.98, DOOR / 2 + 0.3); g.add(btnDn);
+    // crash rails beside the doors at bed height
+    for (const sz of [-1, 1]) { const rl = rbox(0.06, 0.12, Math.max(0.3, (W - DOOR) / 2 - 0.3), 0.03, M.rail()); rl.position.set(-0.05, 0.9, sz * (DOOR / 2 + 0.2 + Math.max(0.3, (W - DOOR) / 2 - 0.3) / 2)); g.add(rl); }
+    g.traverse(o => { o.userData.pickKind = 'lift'; });
+    return { group: g, setOpen, disp, btnUp, btnDn, W, DOOR };
+  }
+
+  // ---------- destination-dispatch kiosk ----------
+  function makeKiosk() {
+    const g = new THREE.Group();
+    const ped = rbox(0.14, 1.05, 0.34, 0.04, M.steel()); ped.position.y = 0.525; g.add(ped);
+    const foot = rbox(0.34, 0.03, 0.44, 0.03, M.dark()); foot.position.y = 0.015; g.add(foot);
+    const c = cv(320, 400), x = c.getContext('2d');
+    x.fillStyle = '#f6f1ea'; x.fillRect(0, 0, 320, 400);
+    x.fillStyle = '#1d1d1f'; x.font = '600 30px Lora, Georgia, serif'; x.fillText('Where to?', 24, 54);
+    x.fillStyle = '#6e6e73'; x.font = '400 17px Carlito, Barlow, sans-serif'; x.fillText('Touch a floor — a car is assigned to you', 24, 82);
+    const rows = [['7', 'Wards 7A · 7B'], ['6', 'Wards 6A · ICU'], ['5', 'Imaging · Cath lab'], ['4', 'Surgical floor · you are here'], ['3', 'PACU step-down'], ['2', 'Outpatient'], ['1', 'Lobby · discharge'], ['B1', 'Sterile processing']];
+    rows.forEach((r, i) => {
+      const y = 104 + i * 36; x.fillStyle = r[0] === '4' ? '#eaf0fb' : '#ffffff'; x.fillRect(16, y, 288, 30);
+      x.fillStyle = r[0] === '4' ? '#1b4fa6' : '#1d1d1f'; x.font = '600 20px Carlito, Barlow, sans-serif'; x.fillText(r[0], 30, y + 21);
+      x.fillStyle = '#6e6e73'; x.font = '400 16px Carlito, Barlow, sans-serif'; x.fillText(r[1], 72, y + 21);
+    });
+    const tex = new THREE.CanvasTexture(c); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = 4;
+    const bez = rbox(0.04, 0.42, 0.34, 0.03, M.dark()); bez.position.set(-0.05, 1.22, 0); bez.rotation.z = -0.35; g.add(bez);
+    const scr = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.38), new THREE.MeshBasicMaterial({ map: tex })); scr.rotation.set(0, -Math.PI / 2, 0); scr.rotation.z = 0; scr.position.set(-0.08, 1.23, 0); scr.rotation.set(0, -Math.PI / 2, -0.35, 'ZYX'); g.add(scr);
+    g.traverse(o => { o.userData.pickKind = 'lift-kiosk'; });
+    return g;
+  }
+
+  // ---------- free-standing wayfinding pylon (lobby design language: warm white, serif title, one tint) ----------
+  function makePylon() {
+    const g = new THREE.Group();
+    const body = rbox(0.14, 2.3, 0.7, 0.04, mat(0xf6f1ea, 0.7, 0.02)); body.position.y = 1.2; g.add(body);
+    const base = rbox(0.4, 0.05, 0.9, 0.03, M.steel2()); base.position.y = 0.025; g.add(base);
+    const c = cv(256, 840), x = c.getContext('2d');
+    x.fillStyle = '#f6f1ea'; x.fillRect(0, 0, 256, 840); x.fillStyle = '#1b4fa6'; x.fillRect(0, 0, 256, 150);
+    x.fillStyle = '#ffffff'; x.font = '600 44px Lora, Georgia, serif'; x.textAlign = 'center'; x.fillText('Elevators', 128, 72);
+    x.font = '700 70px Carlito, Barlow, sans-serif'; x.fillText('\u2192', 128, 138);
+    x.fillStyle = '#1d1d1f'; x.font = '600 30px Carlito, Barlow, sans-serif'; x.fillText('Core E', 128, 215);
+    x.fillStyle = '#6e6e73'; x.font = '400 24px Carlito, Barlow, sans-serif';
+    ['Bed lifts  B1 \u00b7 B2', 'Passenger  P1 \u00b7 P2', 'Floors  B1 \u2013 7', '', 'Wards 6 \u00b7 7  \u2191', 'PACU step-down 3  \u2193', 'Imaging 5', 'Sterile processing B1'].forEach((l, i) => x.fillText(l, 128, 270 + i * 44));
+    x.fillStyle = '#1b4fa6'; x.fillRect(40, 236, 176, 3);
+    const tex = new THREE.CanvasTexture(c); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = 4;
+    for (const side of [1, -1]) { const face = new THREE.Mesh(new THREE.PlaneGeometry(0.64, 2.1), new THREE.MeshBasicMaterial({ map: tex })); face.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2; face.position.set(side * -0.075, 1.2, 0); g.add(face); }
+    g.traverse(o => { o.userData.pickKind = 'lift-kiosk'; });
+    return g;
+  }
+
+  // ---------- lobby signage ----------
+  function makeSign(text, sub, color) {
+    const c = cv(768, 192), x = c.getContext('2d');
+    x.fillStyle = '#f6f1ea'; x.fillRect(0, 0, 768, 192); x.fillStyle = color; x.fillRect(0, 0, 16, 192);
+    x.fillStyle = '#1d1d1f'; x.font = '600 56px Lora, Georgia, serif'; x.fillText(text, 48, 92);
+    x.fillStyle = '#6e6e73'; x.font = '400 30px Carlito, Barlow, sans-serif'; x.fillText(sub, 48, 148);
+    const tex = new THREE.CanvasTexture(c); tex.encoding = THREE.sRGBEncoding;
+    const s = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 0.5), new THREE.MeshBasicMaterial({ map: tex })); s.rotation.y = -Math.PI / 2; return s;
+  }
+
+  // ---------- build the bank (called from the floor builder with the core's group) ----------
+  H.buildLiftBank = function (coreGroup, hw, hd) {
+    // coreGroup is centred at the core; its lobby face is at local x = -hw (world FACE_X)
+    const root = new THREE.Group(); root.position.set(-hw - FACE_X, 0, 0); coreGroup.add(root);   // children use world x/z
+    // face wall segments between hoistways
+    const wall = M.wall();
+    const segs = [[-7, -6.7], [-3.7, -3.2], [-0.2, 1.1], [3.3, 3.9], [6.1, 7]];
+    segs.forEach(([a, b]) => { if (b - a > 0.05) { const w = rbox(0.14, 3.2, b - a, 0.02, wall); w.position.set(FACE_X + 0.07, 1.6, (a + b) / 2); root.add(w); } });
+    const roofCap = rbox(0.2, 0.25, 14, 0.02, mat(0xcfd4da, 0.5, 0.2)); roofCap.position.set(FACE_X + 0.1, 3.3, 0); root.add(roofCap);
+    for (const def of LIFTS.defs) {
+      const L = makeLift(def); root.add(L.group);
+      LIFTS.byId[def.id] = Object.assign(def, { k: 0, want: 0, dir: 0, api: L, floorShown: def.floor, phase: 'idle' });
+    }
+    const kiosk = makeKiosk(); kiosk.position.set(FACE_X - 0.95, 0, 7.6); root.add(kiosk);
+    const kiosk2 = makeKiosk(); kiosk2.position.set(FACE_X - 0.95, 0, -8.0); root.add(kiosk2);
+    const sgn = makeSign('Elevator Core E', 'Bed lifts B1 · B2    Passenger P1 · P2    Floors B1 – 7', '#1b4fa6'); sgn.position.set(FACE_X - 0.02, 2.75, 0.45); root.add(sgn);
+    // lobby pad and crash rail along the OR end wall opposite
+    const pad = new THREE.Mesh(new THREE.PlaneGeometry(6.4, 48), mat(0xdde5ee, 0.95, 0)); pad.rotation.x = -Math.PI / 2; pad.position.set(50.25, 0.028, 0); pad.receiveShadow = true; root.add(pad);
+    for (const [a, b] of [[-24, -14.6], [-11.4, -2.6], [2.6, 11.4], [14.6, 24]]) { const rail = rbox(0.06, 0.12, b - a - 0.4, 0.03, M.rail()); rail.position.set(47.2, 0.9, (a + b) / 2); root.add(rail); }
+    // wayfinding pylons in the OR end hall, flanking the centre bay, visible from the bird's-eye view
+    for (const pz of [-6.2, 6.2]) { const py = makePylon(); py.position.set(45.4, 0, pz); root.add(py); }
+    // benches by the passenger lifts
+    for (const bz of [9.6, -10.6]) { const seat = rbox(0.45, 0.06, 1.6, 0.03, mat(0xd9c9b4, 0.8, 0.02)); seat.position.set(FACE_X - 0.55, 0.46, bz); root.add(seat); for (const lz of [-0.6, 0.6]) { const leg = rbox(0.4, 0.44, 0.06, 0.02, M.steel2()); leg.position.set(FACE_X - 0.55, 0.22, bz + lz); root.add(leg); } }
+    LIFTS.root = root;
+  };
+
+  // ---------- traffic ----------
+  const SPEED_WALK = 1.15, SPEED_CHAIR = 1.0, SPEED_AMR = 1.0;
+  const DOOR_PT = { x: 47.0, z: 0.0 };           // the centre bay in the OR end wall (side doors at z = ±13)
+  function driveTo(obj, p, speed, dt, turn) {
+    const o = obj.position, dx = p.x - o.x, dz = p.z - o.z, d = Math.hypot(dx, dz), step = speed * dt;
+    if (d <= step) { o.x = p.x; o.z = p.z; return true; }
+    o.x += dx / d * step; o.z += dz / d * step;
+    if (turn !== false) { const h = Math.atan2(dx, dz); let dh = h - obj.rotation.y; while (dh > Math.PI) dh -= Math.PI * 2; while (dh < -Math.PI) dh += Math.PI * 2; obj.rotation.y += Math.max(-4 * dt, Math.min(4 * dt, dh)); }
+    return false;
+  }
+  function pathRun(a, dt) { const p = a.path[a.idx]; if (!p) return true; if (driveTo(a.obj, p, a.speed, dt)) a.idx++; return a.idx >= a.path.length; }
+
+  // walkers: staff and patients coming and going
+  const ROLES = ['nurse', 'physician', 'patient', 'visitor', 'tech', 'orderly', 'patient', 'nurse', 'visitor'];
+  let walkerSeed = 300;
+  function spawnWalker(scene, dir) {
+    const role = ROLES[walkerSeed % ROLES.length];
+    const fig = H.makeHuman({ role, seed: walkerSeed++ }); const rig = fig.userData.human; rig.setPose('stand');
+    const liftId = Math.random() < 0.5 ? 'P1' : 'P2'; const L = LIFTS.byId[liftId];
+    const inside = { x: FACE_X + 1.6, z: L.z + (Math.random() - 0.5) * 0.6 }, door = { x: FACE_X - 0.5, z: L.z };
+    const hall = { x: 43.2 + Math.random() * 2, z: (Math.random() < 0.5 ? -1 : 1) * (14 + Math.random() * 5) };
+    const lobbyPt = { x: 50.5, z: L.z * 0.5 };
+    const sideDoor = { x: 47.0, z: Math.sign(hall.z) * 13 };   // staff use the side door on their side of the floor
+    const a = { kind: 'walker', obj: fig, rig, speed: SPEED_WALK * (0.9 + Math.random() * 0.25), lift: liftId, idx: 0, timer: 0 };
+    if (dir === 'arrive') { fig.position.set(inside.x, 0, inside.z); fig.rotation.y = -Math.PI / 2; fig.visible = false; a.phase = 'wait-door'; a.path = [door, lobbyPt, { x: 48.6, z: sideDoor.z }, sideDoor, { x: 45.4, z: sideDoor.z }, hall]; }
+    else { fig.position.set(hall.x, 0, hall.z); a.phase = 'walk'; a.path = [{ x: 45.4, z: sideDoor.z }, sideDoor, { x: 48.6, z: sideDoor.z }, lobbyPt, door]; a.then = 'board'; a.inside = inside; }
+    scene.add(fig); LIFTS.traffic.push(a);
+    if (window.AGENTS) a.agent = AGENTS.add({ ref: a, r: 0.32, mass: 0.8, walls: false, statics: false, active: () => fig.visible, moving: () => a.phase === 'walk', getPos: () => ({ x: fig.position.x, z: fig.position.z }), setPos: (x, z) => { fig.position.x = x; fig.position.z = z; } });
+    return a;
+  }
+  function removeTraffic(scene, a) { scene.remove(a.obj); const i = LIFTS.traffic.indexOf(a); if (i >= 0) LIFTS.traffic.splice(i, 1); if (a.agent && window.AGENTS) AGENTS.list.splice(AGENTS.list.indexOf(a.agent), 1); }
+
+  // supply AMR riding B2
+  function spawnSupplyAMR(scene) {
+    const amr = H.makeAMR('ld250', 0x00c8d2); const ud = amr.userData.amr;
+    const cart = H.makeCart(); ud.payloadSlot.add(cart); cart.position.set(0, 0.02, 0); cart.scale.setScalar(0.9);
+    const L = LIFTS.byId.B2;
+    amr.position.set(FACE_X + 1.9, 0, L.z); amr.rotation.y = -Math.PI / 2; amr.visible = false; scene.add(amr);
+    const a = { kind: 'amr', obj: amr, speed: SPEED_AMR, lift: 'B2', idx: 0, timer: 8, phase: 'ride', path: [], home: { x: FACE_X + 1.9, z: L.z } };
+    LIFTS.traffic.push(a);
+    if (window.AGENTS) a.agent = AGENTS.add({ ref: a, r: 0.6, mass: 3.5, walls: false, statics: false, active: () => amr.visible, moving: () => a.phase === 'out' || a.phase === 'back', getPos: () => ({ x: amr.position.x, z: amr.position.z }), setPos: (x, z) => { amr.position.x = x; amr.position.z = z; } });
+    return a;
+  }
+
+  // wheelchair boarding (hooked into the care fleet's arriveElevator)
+  function boardChair(b, origArrive) {
+    b.state = 'board'; b.care.setStatus('#f0a020');
+    const liftId = b.wing === 'N' ? 'P1' : 'P2'; const L = LIFTS.byId[liftId];
+    const a = { kind: 'chair', obj: b.group, bot: b, speed: SPEED_CHAIR, lift: liftId, idx: 0, timer: 0, phase: 'wait-door', path: [{ x: FACE_X - 0.6, z: L.z }, { x: FACE_X + 1.5, z: L.z }], origArrive };
+    b.speech.userData.show('Lift ' + liftId + ' is on its way', b.accent, false);
+    LIFTS.traffic.push(a);
+  }
+  LIFTS.boardChair = boardChair;
+
+  function tick(dt, t, scene) {
+    // ---- door controller + displays ----
+    for (const id in LIFTS.byId) {
+      const L = LIFTS.byId[id];
+      const prev = L.k; L.k += (L.want - L.k) * Math.min(1, dt * 1.6);
+      if (Math.abs(L.k - prev) > 0.0005) L.api.setOpen(L.k);
+      const arriving = L.k > 0.5;
+      const dir = L.want ? (L.kind === 'bed' ? 1 : (id === 'P1' ? 1 : -1)) : 0;
+      if (L._shown !== (arriving ? 1 : 0) || L._dir !== dir) { L._shown = arriving ? 1 : 0; L._dir = dir; L.api.disp.draw(4, dir, arriving); L.api.btnUp.material.emissiveIntensity = dir > 0 ? 1.2 : 0.15; L.api.btnDn.material.emissiveIntensity = dir < 0 ? 1.2 : 0.15; }
+    }
+    // ---- spawn schedule ----
+    LIFTS._spawnT = (LIFTS._spawnT || 0) + dt;
+    if (LIFTS._spawnT > 11 && LIFTS.traffic.filter(a => a.kind === 'walker').length < 7) { LIFTS._spawnT = 0; spawnWalker(scene, Math.random() < 0.5 ? 'arrive' : 'depart'); }
+    if (!LIFTS._amr) LIFTS._amr = spawnSupplyAMR(scene);
+    // ---- advance traffic ----
+    const want = {};
+    for (const a of LIFTS.traffic.slice()) {
+      const L = LIFTS.byId[a.lift];
+      if (a.kind === 'walker') {
+        if (a.rig) a.rig.update(dt, t, a.phase === 'walk' || a.phase === 'exit' ? a.speed : 0);
+        if (a.phase === 'wait-door') { want[a.lift] = true; if (L.k > 0.9) { a.obj.visible = true; a.phase = 'exit'; a.hold = 1.2; } continue; }
+        if (a.phase === 'exit') { want[a.lift] = true; if (pathRun(a, dt)) { removeTraffic(scene, a); LIFTS.metrics.rides++; continue; } if (a.idx >= 1) a.phase = 'walk'; continue; }
+        if (a.phase === 'walk') { if (pathRun(a, dt)) { if (a.then === 'board') { a.phase = 'board-wait'; } else { removeTraffic(scene, a); } } continue; }
+        if (a.phase === 'board-wait') { want[a.lift] = true; if (L.k > 0.9) { a.phase = 'board'; a.path = [a.inside]; a.idx = 0; } continue; }
+        if (a.phase === 'board') { want[a.lift] = true; if (pathRun(a, dt)) { a.obj.visible = false; a.phase = 'gone'; a.timer = 2.0; } continue; }
+        if (a.phase === 'gone') { a.timer -= dt; if (a.timer <= 0) { removeTraffic(scene, a); LIFTS.metrics.rides++; } continue; }
+      }
+      if (a.kind === 'chair') {
+        const b = a.bot;
+        if (a.phase === 'wait-door') { want[a.lift] = true; if (L.k > 0.9) { a.phase = 'board'; } continue; }
+        if (a.phase === 'board') { want[a.lift] = true; if (pathRun(a, dt)) { a.obj.visible = false; a.phase = 'ride'; a.timer = 16 + Math.random() * 8; LIFTS.metrics.boarded++; if (b.patientFig) { b.care.seat.remove(b.patientFig); b.patientFig = null; } b.speech.userData.show('Riding up to the ward', b.accent, false); } continue; }
+        if (a.phase === 'ride') { a.timer -= dt; if (a.timer <= 0) { a.phase = 'return-wait'; } continue; }
+        if (a.phase === 'return-wait') { want[a.lift] = true; if (L.k > 0.9) { a.obj.visible = true; a.obj.rotation.y = -Math.PI / 2; a.phase = 'alight'; a.path = [{ x: FACE_X - 0.8, z: L.z }, { x: 50.4, z: L.z }]; a.idx = 0; } continue; }
+        if (a.phase === 'alight') { if (a.obj.position.x > FACE_X - 1.2) want[a.lift] = true; if (pathRun(a, dt)) { a.phase = 'done'; const zs = b.wing === 'N' ? -1 : 1; const zc = b.wing === 'N' ? -20.5 : 20.5; b.ride = false; b.state = 'return'; b.wp = [{ x: 48.2, z: 0 }, { x: 47, z: 0 }, { x: 44.8, z: 3 * zs }, { x: b.home.x, z: zc }, { x: b.home.x, z: b.home.z }]; b.locLabel = 'Returning to base'; b.care.setStatus('#9fb0c2'); b.speech.userData.show('Back to base', b.accent, false); removeTraffic(scene, a); } continue; }
+      }
+      if (a.kind === 'amr') {
+        const ud = a.obj.userData.amr;
+        if (a.phase === 'ride') { a.timer -= dt; if (a.timer <= 0) { a.phase = 'wait-door'; } continue; }
+        if (a.phase === 'wait-door') { want[a.lift] = true; if (L.k > 0.9) { a.obj.visible = true; a.phase = 'out'; a.path = [{ x: FACE_X - 0.6, z: L.z }, { x: 50.5, z: -0.6 }, { x: 48.0, z: 0 }, { x: 44.6, z: 0 }, { x: 43.4, z: 1.2 }]; a.idx = 0; if (ud.statusScreen) ud.statusScreen.set('Supply drop', 'Core E → DOCK-E'); } continue; }
+        if (a.phase === 'out') { if (a.obj.position.x > FACE_X - 1.5) want[a.lift] = true; if (pathRun(a, dt)) { a.phase = 'dwell'; a.timer = 14; if (ud.statusScreen) ud.statusScreen.set('Unloading', 'Case cart · OR 8'); } continue; }
+        if (a.phase === 'dwell') { a.timer -= dt; if (a.timer <= 0) { a.phase = 'back'; a.path = [{ x: 44.6, z: 0 }, { x: 48.0, z: 0 }, { x: 50.5, z: -0.6 }, { x: FACE_X - 0.6, z: L.z }, a.home]; a.idx = 0; if (ud.statusScreen) ud.statusScreen.set('Returning', 'Lift B2 → Level 2'); } continue; }
+        if (a.phase === 'back') { if (a.obj.position.x > 53) want[a.lift] = true; if (pathRun(a, dt)) { a.obj.visible = false; a.phase = 'ride'; a.timer = 40 + Math.random() * 20; LIFTS.metrics.rides++; } continue; }
+      }
+    }
+    for (const id in LIFTS.byId) { const L = LIFTS.byId[id]; L.want = (want[id] || L.extWant) ? 1 : 0; }
+  }
+
+  function onReady() {
+    const scene = APP.getScene();
+    // hook the care fleet: wheelchair rides now board a passenger lift instead of stopping at the core door
+    if (window.CARE && CARE.arriveElevator) { const orig = CARE.arriveElevator.bind(CARE); CARE.arriveElevator = (b) => boardChair(b, orig); }
+    LIFTS.tick = (dt, t) => tick(dt, t, scene);
+    APP.addTicker((dt, t) => LIFTS.tick(dt, t));
+  }
+  // this module loads before scene.js defines APP; register once the page has loaded
+  if (window.APP && APP.on) APP.on('ready', onReady); else window.addEventListener('load', () => { if (window.APP && APP.on) APP.on('ready', onReady); });
+})();
+
+</script>
   <script>
 /* people_models.js — high-fidelity articulated human figures for the OR floor.
    Parametric bodies (gender-differentiated silhouettes), role-based clinical
@@ -5111,10 +5442,11 @@ window.HOSP = window.HOSP || {};
     const doorOnLeft = def.open === 'W';
     wall(g, -hw, -hd, hw, -hd, {});
     wall(g, -hw, hd, hw, hd, {});
-    if (doorOnLeft) { wall(g, -hw, -hd, -hw, hd, { door: { width: 2.2, center: 0.5 } }); wall(g, hw, -hd, hw, hd, {}); }
+    if (def.lifts) { wall(g, hw, -hd, hw, hd, {}); }   // lobby face is built by the lift bank
+    else if (doorOnLeft) { wall(g, -hw, -hd, -hw, hd, { door: { width: 2.2, center: 0.5 } }); wall(g, hw, -hd, hw, hd, {}); }
     else { wall(g, hw, -hd, hw, hd, { door: { width: 2.2, center: 0.5 } }); wall(g, -hw, -hd, -hw, hd, {}); }
-    const sc = H.makeScreen(1.6, 1.0, 'roominfo', { title: def.name.toUpperCase().slice(0, 14), code: def.id, sub: 'building core', status: 'ONLINE', accent: '#a8407a' });
-    sc.position.set(doorOnLeft ? hw - 0.14 : -hw + 0.14, 1.8, 0); sc.rotation.y = doorOnLeft ? -Math.PI / 2 : Math.PI / 2; g.add(sc);
+    if (!def.lifts) { const sc = H.makeScreen(1.6, 1.0, 'roominfo', { title: def.name.toUpperCase().slice(0, 14), code: def.id, sub: 'building core', status: 'ONLINE', accent: '#a8407a' });
+    sc.position.set(doorOnLeft ? hw - 0.14 : -hw + 0.14, 1.8, 0); sc.rotation.y = doorOnLeft ? -Math.PI / 2 : Math.PI / 2; g.add(sc); }
     const s = H.lightStrip(def.w - 1, 0xeaf2ff); s.position.set(0, 3.12, 0); g.add(s);
     if (def.fill) def.fill(g, hw, hd);
     g.userData.room = { id: def.id, status: def.status || 'core', center: new THREE.Vector3(def.cx, 0, def.cz), side: 'core', name: def.name, kind: 'core' };
@@ -5145,7 +5477,7 @@ window.HOSP = window.HOSP || {};
     const root = new THREE.Group(); scene.add(root);
     const labels = new THREE.Group(); root.add(labels);
 
-    const ENV_X = 70, ENV_Z = 36;
+    const ENV_X = 72, ENV_Z = 36;
     const slab = new THREE.Mesh(new THREE.BoxGeometry(ENV_X * 2 + 8, 0.4, ENV_Z * 2 + 8), FLOOR_MAT());
     slab.position.y = -0.2; slab.receiveShadow = true; root.add(slab);
 
@@ -5217,11 +5549,13 @@ window.HOSP = window.HOSP || {};
         fill: (g) => { [-3.5, -1.5, 0.5, 2.5].forEach(x => { const c = H.makeLinenCart(); c.position.set(x, 0, 1.5); g.add(c); }); } },
       { id: 'W-03', name: 'Pharmacy Dispenser', cx: -60, cz: 10.5, w: 14, d: 10.5, open: 'E', accent: 0xf59e0b,
         fill: (g) => { const p = H.makePharmacyArm(); p.position.set(0, 0, -3.8); g.add(p); const d = H.makeDesk(); d.position.set(3, 0, 1.5); g.add(d); } },
-      { id: 'E-04', name: 'Mobile Imaging', cx: 60, cz: -10.5, w: 14, d: 10.5, open: 'W', accent: 0x8b5cf6,
+      { id: 'E-04', name: 'Mobile Imaging', cx: 60.5, cz: -12.25, w: 14, d: 10.5, open: 'W', accent: 0x8b5cf6,
         fill: (g) => { const c = H.makeCArm(); c.position.set(1, 0, 1.5); g.add(c); const d = H.makeCart(); d.position.set(-3, 0, 1.5); g.add(d); } },
-      { id: 'E-05', name: 'Robotics Charging', cx: 60, cz: 0, w: 14, d: 8.5, open: 'W', accent: 0x00c8d2,
+      { id: 'E-LIFT', name: 'Elevator Core E', cx: 60.5, cz: 0, w: 14, d: 14, open: 'W', accent: 0x1b4fa6, lifts: true,
+        fill: (g, hw, hd) => { if (H.buildLiftBank) H.buildLiftBank(g, hw, hd); } },
+      { id: 'E-05', name: 'Robotics Charging', cx: 60.5, cz: 11.25, w: 14, d: 8.5, open: 'W', accent: 0x00c8d2,
         fill: (g) => { [-4, -1.3, 1.4, 4].forEach((x, i) => { const pad = H.makeChargingPad(0x00c8d2); pad.position.set(x, 0, 1.4); g.add(pad); const a = H.makeDockedAMR([0xff8a3c, 0x00c8d2, 0x14b8a6, 0x00c8d2][i]); a.position.set(x, 0, 1.4); g.add(a); }); } },
-      { id: 'E-03', name: 'Biohazard Waste Sort', cx: 60, cz: 10.5, w: 14, d: 10.5, open: 'W', accent: 0xef4444,
+      { id: 'E-03', name: 'Biohazard Waste Sort', cx: 60.5, cz: 20.75, w: 14, d: 10.5, open: 'W', accent: 0xef4444,
         fill: (g) => { const b = H.makeBiohazardBins(); b.position.set(-1, 0, 1.5); g.add(b); const b2 = H.makeBiohazardBins(); b2.position.set(2.5, 0, -2); g.add(b2); } },
     ];
     coreDefs.forEach(def => rooms.push(coreRoom(root, def)));
@@ -5229,13 +5563,15 @@ window.HOSP = window.HOSP || {};
     // ---- robot/sterile spine end caps + people-corridor closure ----
     const blockMat = EXT_MAT();
     wall(root, -50, -24.25, -50, 24.25, { mat: blockMat, door: { width: 3.0, center: 0.5, panel: 'glass' } });
-    wall(root, 50, -24.25, 50, 24.25, { mat: blockMat, door: { width: 3.0, center: 0.5, panel: 'glass' } });
+    // east end wall: a 5 m open centre bay to the lift lobby plus two 3 m glass doors (z = ±13)
+    wall(root, 47, -24.25, 47, -2.5, { mat: blockMat, door: { width: 3.0, center: (-13 + 24.25) / 21.75, panel: 'glass' } });
+    wall(root, 47, 2.5, 47, 24.25, { mat: blockMat, door: { width: 3.0, center: (13 - 2.5) / 21.75, panel: 'glass' } });
+    { const pf = H.doorFrame(5.0, 2.55); pf.position.set(47, 0, 0); pf.rotation.y = Math.PI / 2; root.add(pf); }
     // cyan robot-entry thresholds at the sterile spine doors
-    [-50, 50].forEach(sx => {
-      const t = H.doorThreshold(3.0, 2.55, 0x18c8ff); t.position.set(sx, 0, 0); t.rotation.y = Math.PI / 2; root.add(t);
-    });
+    { const t = H.doorThreshold(3.0, 2.55, 0x18c8ff); t.position.set(-50, 0, 0); t.rotation.y = Math.PI / 2; root.add(t); }
+    { const t = H.doorThreshold(5.0, 2.55, 0x18c8ff); t.position.set(47, 0, 0); t.rotation.y = Math.PI / 2; root.add(t); }
     // close the people-corridor ends not covered by recovery rooms
-    [[-50, -42], [42, 50]].forEach(([a, b]) => { wall(root, a, -24.25, b, -24.25, { mat: blockMat }); wall(root, a, 24.25, b, 24.25, { mat: blockMat }); });
+    [[-50, -42], [42, 47]].forEach(([a, b]) => { wall(root, a, -24.25, b, -24.25, { mat: blockMat }); wall(root, a, 24.25, b, 24.25, { mat: blockMat }); });
 
     // ---- charging docks on the spine ----
     const dW = H.makeChargingDock('DOCK-W', 0x00c8d2); dW.position.set(-44, 0, -1.6); root.add(dW);
@@ -5278,9 +5614,10 @@ window.HOSP = window.HOSP || {};
       ['PRE-OP HOLDING', 'Z-04-H01', 'M-031 TTT', '#1a8f8a', 0, 9, -28.55],
       ['PACU RECOVERY', 'Z-04-K01', 'M-032 TTT', '#1a8f8a', 0, 9, 28.55],
       ['BUILDING CORE W', 'Z-04-C-W', 'M-014 TTT', '#a8407a', -60, 9.5, 0],
-      ['BUILDING CORE E', 'Z-04-C-E', 'M-015 TTT', '#a8407a', 60, 9.5, 0],
+      ['BUILDING CORE E', 'Z-04-C-E', 'M-015 TTT', '#a8407a', 60.5, 9.5, 14],
+      ['ELEVATOR CORE E', 'Z-04-E-L', 'LIFTS B1 · B2 · P1 · P2', '#1b4fa6', 50.25, 13.5, 0],
     ];
-    L.forEach(([p, cl, cr, hex, x, y, z]) => { const s = H.makeLabel(p, cl, cr, hex); s.position.set(x, y, z); labels.add(s); });
+    L.forEach(([p, cl, cr, hex, x, y, z]) => { const s = H.makeLabel(p, cl, cr, hex); s.position.set(x, y, z); if (cl === 'Z-04-E-L') s.scale.multiplyScalar(1.35); labels.add(s); });
     labels.visible = false;
 
     H.floorData = { root, rooms, overlays: ov, labels, bounds: { x: ENV_X - 2, z: ENV_Z - 2 } };
@@ -5357,7 +5694,10 @@ window.APP = (function () {
     setHover(root);
   }
 
-  const ORBIT_HOME = { pos: new THREE.Vector3(49, 45, 58), target: new THREE.Vector3(20, 3, 8) };
+  // opening view: the original south-east framing orbited 12° toward the south (azimuth 30° → 18° from +z), so the
+  // west-facing lift doors show more; dial HOME_ORBIT_DEG to adjust (positive = more toward the south)
+  const HOME_ORBIT_DEG = 22;
+  const ORBIT_HOME = (() => { const t = new THREE.Vector3(23, 3, 8), r = Math.hypot(29, 50), th = Math.atan2(29, 50) - THREE.MathUtils.degToRad(HOME_ORBIT_DEG); return { pos: new THREE.Vector3(t.x + r * Math.sin(th), 45, t.z + r * Math.cos(th)), target: t }; })();
   const listeners = {};
   const tickers = [];
   let elapsed = 0;
@@ -7927,7 +8267,7 @@ window.HOSP = window.HOSP || {};
   const SENT = C.SENT, SERVICES = C.SERVICES, SCENARIOS = C.SCENARIOS;
 
   const CARE_SPEED = 1.7, RIDE_SPEED = 1.15, TURN_INT = 2.9;
-  const ELEVATOR = { x: 53, z: 2 };
+  const ELEVATOR = { x: 52.8, z: 2.2 };   // passenger lifts P1 (N rides) / P2 (S rides) on the Core E lobby face
   function corrZ(wing) { return wing === 'N' ? -18 : 18; }
   function topY(kind) { return { companion: 1.98, meal: 2.02, chair: 1.5, manip: 2.4, wayfinder: 2.06 }[kind] || 2; }
   function svc(id) { return SERVICES.find(s => s.id === id); }
@@ -8171,7 +8511,8 @@ window.HOSP = window.HOSP || {};
       b.state = 'ride'; b.care.setStatus('#35c2ff');
       const zc = corrZ(b.wing), zs = b.wing === 'N' ? -1 : 1;
       const out = b.room ? b.doorExit() : [{ x: b.group.position.x, z: zc }];
-      b.wp = out.concat([{ x: 45, z: zc }, { x: 50, z: 8 * zs }, { x: ELEVATOR.x, z: ELEVATOR.z * zs }]);
+      const lz = ELEVATOR.z + (zs > 0 ? 2.8 : 0);
+      b.wp = out.concat([{ x: 44.6, z: zc }, { x: 44.8, z: 3 * zs }, { x: 47, z: 0 }, { x: 50.4, z: lz }, { x: ELEVATOR.x, z: lz }]);
       b.locLabel = (b.wing === 'N' ? 'Pre-op' : 'PACU') + ' → Elevator Core E';
       b.speech.userData.show('Taking you to the elevator', b.accent, true);
     },
@@ -8180,7 +8521,7 @@ window.HOSP = window.HOSP || {};
       b.speech.userData.show('Arrived · take your time', b.accent, false);
       b.ride = false; b.state = 'return';
       const zc = corrZ(b.wing), zs = b.wing === 'N' ? -1 : 1;
-      b.wp = [{ x: 50, z: 8 * zs }, { x: b.home.x, z: zc }, { x: b.home.x, z: b.home.z }];
+      b.wp = [{ x: 48.2, z: 0 }, { x: 47, z: 0 }, { x: 44.8, z: 3 * zs }, { x: b.home.x, z: zc }, { x: b.home.x, z: b.home.z }];
       b.locLabel = 'Returning to base';
       b.care.setStatus('#9fb0c2');
     },
@@ -9936,7 +10277,7 @@ window.HOSP = window.HOSP || {};
     this.plan = spec.plan || []; this.step = 0; this.waitT = spec.delay || 0;
     this.state = spec.role === 'reserve' ? 'charge' : 'park';
     this.phase = null; this.phaseT = 0; this.phaseIdx = 0; this.phases = null;
-    this.task = spec.role === 'reserve' ? 'Reserve · charging' : 'Staged · charging';
+    this.task = spec.role === 'reserve' ? 'Reserve · charging' : spec.role === 'lift' ? 'Riding down from the ward' : 'Staged · charging';
     this.deckY = DECK_TRAVEL; this.deckX = 0; this.beltV = 0;
     this.battery = spec.battery == null ? 62 + (this.n * 9) % 34 : spec.battery;
     this.patient = null; this.patientTag = ''; this.seed = this.n * 3 + 1;
@@ -9955,7 +10296,7 @@ window.HOSP = window.HOSP || {};
       for (const off of [0.55, -0.55]) {
         this.agents.push(AGENTS.add({
           ref: this, r: 0.54, mass: 4.2, walls: true, statics: false,
-          active: () => true,
+          active: () => this.group.visible !== false,
           moving: () => this.curSpeed > 0.08,
           getPos: () => { const s = Math.sin(this.heading), c = Math.cos(this.heading); return { x: this.group.position.x + s * off, z: this.group.position.z + c * off }; },
           setPos: (x, z) => {
@@ -9978,6 +10319,7 @@ window.HOSP = window.HOSP || {};
     if (this.state === 'hold') return ['Held', '#d9432f'];
     if (this.state === 'xfer') return ['Transferring', '#f0a020'];
     if (this.state === 'align') return ['Aligning', '#35c2ff'];
+    if (this.state === 'travel' && this.liftPhase) return [this.liftPhase === 'ride' ? 'In lift' : 'At lift', '#9a5b00'];
     if (this.state === 'travel') return [this.patient ? 'Transporting' : 'En route', ACCENT_HEX];
     if (this.state === 'charge') return ['Charging', '#30a24d'];
     return [this.battery >= 99 ? 'Ready' : 'Charging', '#30a24d'];
@@ -10115,6 +10457,19 @@ window.HOSP = window.HOSP || {};
     return hit ? { ref: hit, d: hitD } : null;
   };
 
+  // ---- riding Elevator Core E: call → enter → (unload patient) → ride → (new patient) → doors → exit ----
+  Unit.prototype.updateLift = function (st, dt) {
+    const LF = window.LIFTS; if (!LF || !LF.byId[st.lift]) { this.step++; return; }
+    const car = LF.car(st.lift), gp = this.group.position;
+    this.liftPhase = this.liftPhase || 'call';
+    const moveTo = (x, z, spd) => { const dx = x - gp.x, dz = z - gp.z, d = Math.hypot(dx, dz); if (d < 0.05) { gp.x = x; gp.z = z; return true; } const k = Math.min(d, spd * dt); gp.x += dx / d * k; gp.z += dz / d * k; this.turnToward(Math.atan2(dx, dz), dt, 2.6); this.curSpeed = spd; return false; };
+    if (this.liftPhase === 'call') { LF.request(st.lift, true); this.task = 'Calling bed lift ' + st.lift; this.rig.setStatus(AMBER); if (LF.isOpen(st.lift)) this.liftPhase = 'enter'; }
+    else if (this.liftPhase === 'enter') { this.task = 'Boarding ' + st.lift + (this.patient ? ' · to the ward' : ''); if (moveTo(car.x, car.z, ROOM_SPEED)) { this.group.visible = false; this.curSpeed = 0; if (this.patient) { this.rig.deck.remove(this.patient); this.patient = null; ALTA.metrics.patients++; this.transfers++; ALTA.metrics.transfers++; } LF.request(st.lift, false); this.liftPhase = 'ride'; this.liftT = st.ride || 24; this.task = 'Riding ' + st.lift + ' · ward 6A'; } }
+    else if (this.liftPhase === 'ride') { this.liftT -= dt; if (this.liftT <= 0) { if (st.arrive) { const p = makePatient(this.seed + 13 + this.transfers); this.attachPatient(p, 'MRN ' + MRNS[(this.n * 3 + this.transfers) % MRNS.length]); p.userData.pat.setIncline(INC_DECK); } this.heading = -Math.PI / 2; this.group.rotation.y = this.heading; LF.request(st.lift, true); this.liftPhase = 'open'; this.task = 'Arriving at level 4 · ' + st.lift; } }
+    else if (this.liftPhase === 'open') { if (LF.isOpen(st.lift)) { this.group.visible = true; this.liftPhase = 'exit'; } }
+    else if (this.liftPhase === 'exit') { this.task = this.patient ? 'Admission from the ward · to pre-op' : 'Leaving ' + st.lift; if (moveTo(LF.doorX - 1.3, car.z, ROOM_SPEED)) { LF.request(st.lift, false); this.liftPhase = null; this.rig.setStatus(ACCENT); this.step++; } }
+  };
+
   Unit.prototype.update = function (dt, t) {
     for (const a of this.agents) a.mass = (this.state === 'park' || this.state === 'charge' || this.state === 'xfer') ? 40 : 4.2;
     const fire = window.FLEET && FLEET.effects && FLEET.effects.fire;
@@ -10133,6 +10488,7 @@ window.HOSP = window.HOSP || {};
     } else if (this.state === 'travel' || this.state === 'align') {
       const st = this.plan[this.step];
       if (!st) { this.step = 0; }
+      else if (st.t === 'lift' && this.liftPhase === 'ride' && this.liftT === undefined) { this.liftT = st.ride || 24; }
       else if (st.t === 'xfer') {
         this.slotRef = st.slot || null; this.beginXfer(st);
       } else if (st.t === 'wait') {
@@ -10145,6 +10501,8 @@ window.HOSP = window.HOSP || {};
           this.dwellT -= dt; if (st.label) this.task = st.label;
           if (this.dwellT <= 0) { this.dwelling = false; this.step++; }
         }
+      } else if (st.t === 'lift') {
+        this.updateLift(st, dt);
       } else if (st.t === 'move') {
         const gp = this.group.position;
         const dx = st.x - gp.x, dz = st.z - gp.z, d = Math.hypot(dx, dz);
@@ -10278,7 +10636,7 @@ window.HOSP = window.HOSP || {};
     slotSpawn(slotPreA, 2, false); slotSpawn(slotPreB, 5, false);
 
     // staging pads: NW end hall (pre-op fleet) and SE end hall (PACU fleet)
-    const padsN = [[-48.5, -22.3], [-47.1, -22.3], [-45.7, -22.3]], padsS = [[48.5, 22.3], [47.1, 22.3]];
+    const padsN = [[-48.5, -22.3], [-47.1, -22.3], [-45.7, -22.3]], padsS = [[46.0, 22.3], [44.6, 22.3]];
     padsN.forEach(([x, z], i) => { const p = makeStagingPad('ALTA ' + (i + 1)); p.position.set(x, 0, z); ALTA.group.add(p); });
     padsS.forEach(([x, z], i) => { const p = makeStagingPad('ALTA ' + (i + 4)); p.position.set(x, 0, z); p.rotation.y = Math.PI; ALTA.group.add(p); });
 
@@ -10292,8 +10650,21 @@ window.HOSP = window.HOSP || {};
     u3.plan = [].concat(exitLeg(u3), orLeg(orOutA, 'receive', 'Dispatched · case closing in ' + orOutA.name), bedLeg(pacuA, 'dropoff', slotPacuA, 'Transporting post-op patient to ' + pacuA.id), homeLeg(u3));
     const u4 = spawn({ wing: 'S', role: 'pacu', x: padsS[1][0], z: padsS[1][1], heading: Math.PI, delay: 92, battery: 64 });
     u4.plan = [].concat(exitLeg(u4), orLeg(orOutB, 'receive', 'Dispatched · case closing in ' + orOutB.name), bedLeg(pacuB, 'dropoff', slotPacuB, 'Transporting post-op patient to ' + pacuB.id), homeLeg(u4));
-    const u5 = spawn({ wing: 'N', role: 'reserve', x: padsN[2][0], z: padsN[2][1], heading: 0, battery: 41 });
-    u5.plan = [];
+    // ALTA-05 shuttles between the ward and this floor through Elevator Core E (bed lift B1)
+    const admitRoom = R('OZ-105'), wardRoom = R('OZ-203');
+    const slotAdmit = makeSlot(admitRoom), slotWard = makeSlot(wardRoom);
+    slotSpawn(slotWard, 7, false);
+    const LX = 53.5, LB1 = -5.2;
+    const u5 = spawn({ wing: 'N', role: 'lift', x: LX + 2.2, z: LB1, heading: -Math.PI / 2, battery: 81 });
+    u5.group.visible = false; u5.state = 'travel'; u5.liftPhase = 'ride'; u5.liftT = 10;
+    u5.plan = [].concat(
+      [{ t: 'lift', lift: 'B1', ride: 26, arrive: true }],
+      [M({ x: 50.5, z: -2.0 }, { speed: ROOM_SPEED, label: 'Admission from the ward · to pre-op' }), M({ x: 47.4, z: 0 }, { speed: ROOM_SPEED }), M({ x: 44.8, z: -4 }, { speed: ROOM_SPEED }), M({ x: 44.8, z: lane('N') })],
+      bedLeg(admitRoom, 'dropoff', slotAdmit, 'Admission · settling patient in ' + admitRoom.id),
+      [M({ x: 44.8, z: lane('N') }), M({ x: 44.8, z: 0 }, { speed: ROOM_SPEED, label: 'Crossing to PACU · ward transfer' }), M({ x: 44.8, z: lane('S') })],
+      bedLeg(wardRoom, 'pickup', slotWard, 'Ward transfer · collecting post-op patient ' + wardRoom.id),
+      [M({ x: 44.8, z: lane('S') }), M({ x: 44.8, z: 4 }, { speed: ROOM_SPEED, label: 'To Elevator Core E · bed lift B1' }), M({ x: 47.4, z: 0 }, { speed: ROOM_SPEED }), M({ x: 50.5, z: -3.5 }, { speed: ROOM_SPEED }), M({ x: 51.9, z: LB1 }, { speed: ALIGN_SPEED, face: Math.PI / 2, label: 'Lining up with bed lift B1' })]
+    );
 
     let hudT = 0;
     ALTA.tick = function (dt, t) {
@@ -10334,7 +10705,7 @@ window.HOSP = window.HOSP || {};
     const ro = wrap.querySelector('#altaRoster');
     ro.innerHTML = ALTA.units.map(u => `<div class="fr-row" id="fr-${u.id}">
         <span class="fr-dot" style="background:${ACCENT_HEX};color:${ACCENT_HEX}"></span>
-        <div class="fr-main"><div class="fr-top"><b>${u.id}</b><span class="fr-kind">${u.role === 'preop' ? 'pre-op → OR' : u.role === 'pacu' ? 'OR → PACU' : 'reserve'}</span><span class="fr-state">Staged</span></div>
+        <div class="fr-main"><div class="fr-top"><b>${u.id}</b><span class="fr-kind">${u.role === 'preop' ? 'pre-op → OR' : u.role === 'pacu' ? 'OR → PACU' : u.role === 'lift' ? 'ward ↔ floor · lifts' : 'reserve'}</span><span class="fr-state">Staged</span></div>
         <div class="fr-task">${u.statusText()}</div>
         <div class="fr-bond"><span class="fr-bond-ic">⚬</span><b>${u.porterName}</b> · <span id="fr-pat-${u.id}">deck clear</span></div>
         <div class="fr-batt"><div class="fr-batt-fill" style="width:${u.battery.toFixed(0)}%"></div></div></div>
@@ -10369,7 +10740,7 @@ window.HOSP = window.HOSP || {};
       <span class="insp-tag" style="color:${ACCENT_HEX};background:${ACCENT_HEX}22">ALTA Platform® · ${u.id}</span>
       <div class="insp-row"><span>Maker</span><b>Able Innovations · Toronto</b></div>
       <div class="insp-row"><span>Class</span><b>Robotic lateral patient transfer</b></div>
-      <div class="insp-row"><span>Role</span><b>${u.role === 'preop' ? 'Pre-op → OR transport' : u.role === 'pacu' ? 'OR → PACU transport' : 'Reserve unit'}</b></div>
+      <div class="insp-row"><span>Role</span><b>${u.role === 'preop' ? 'Pre-op → OR transport' : u.role === 'pacu' ? 'OR → PACU transport' : u.role === 'lift' ? 'Ward ↔ floor via Elevator Core E' : 'Reserve unit'}</b></div>
       <div class="insp-row"><span>Status</span><b style="color:${sc}">${st}</b></div>
       <div class="insp-bar"><i style="width:${b}%;background:${bc}"></i></div>
       <div class="insp-cap">Battery ${b}% · ~${Math.round(b * 0.7)} transfers remaining (≈70 per charge)</div>
