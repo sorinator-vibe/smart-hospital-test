@@ -537,6 +537,7 @@ body.drill-active .fw-bar{ opacity:1; transform:translateX(-50%) translateY(0); 
 
       <div class="view-toggle" id="viewToggle" role="tablist" aria-label="Camera view">
         <button class="vt-btn active" data-view="orbit"><i data-ic="globe"></i>Bird's-eye</button>
+        <button class="vt-btn" data-view="lobby"><i data-ic="lift"></i>Elevator lobby</button>
         <button class="vt-btn" data-view="walk"><i data-ic="walk"></i>Street view</button>
       </div>
 
@@ -5996,6 +5997,15 @@ window.APP = (function () {
     emit('viewchange', 'orbit');
   }
 
+  // Elevator lobby: an elevated frontal view from above the OR end hall onto the Core E lift bank
+  const LOBBY_VIEW = { pos: new THREE.Vector3(33.5, 12.5, 0.6), target: new THREE.Vector3(53.5, 1.6, 0.4) };   // elevated, square-on to the Core E lift bank from above the OR end hall
+  function toLobby() {
+    mode = 'orbit';
+    if (moveCursor) moveCursor.visible = false;
+    camera.fov = 50; walk.fov = walk.tfov = 50; camera.updateProjectionMatrix();
+    flyTo(LOBBY_VIEW.pos, LOBBY_VIEW.target, 1.3, () => { controls.target.copy(LOBBY_VIEW.target); controls.enabled = true; controls.update(); });
+    emit('viewchange', 'lobby');
+  }
   function toggleView() { if (mode === 'orbit') toGround(window.APP._lastRoom || null); else toBirdsEye(); }
 
   function focusRoom(room) {
@@ -6130,7 +6140,7 @@ window.APP = (function () {
   return {
     init,
     on: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); },
-    toBirdsEye, toGround, toggleView, focusRoom,
+    toBirdsEye, toGround, toLobby, toggleView, focusRoom,
     getMode: () => mode,
     setOverlay: (name, on) => { floor.overlays.forEach(o => { if (o.userData.overlay === name) o.visible = on; }); },
     setLabels: (on) => { floor.labels.visible = on; },
@@ -6166,6 +6176,7 @@ window.APP = (function () {
   const ICON = {
     globe: 'M12 3a9 9 0 100 18 9 9 0 000-18M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18',
     walk: 'M13 5a1.5 1.5 0 100-.01M9 21l1.5-5 2-2 1 4 2.5 3M11 9l-2 1.5-1 3M13 9l3 1 1.5 2.5',
+    lift: 'M5 3h14v18H5zM12 3v18M8 10l2-2 2 2M14 14l2 2 2-2',
     legend: 'M4 6h16M4 12h16M4 18h10M3.2 6v.01M3.2 12v.01M3.2 18v.01',
     layers: 'M12 3l9 5-9 5-9-5 9-5M3 13l9 5 9-5M3 16.5l9 5 9-5',
     ops: 'M4 5h16v6H4zM4 15h7v4H4zM14 15h6v4h-6z',
@@ -6559,7 +6570,7 @@ window.APP = (function () {
   }
   document.querySelectorAll('.vt-btn').forEach(b => b.addEventListener('click', () => {
     const v = b.dataset.view; markView(v);
-    if (v === 'walk') APP.toGround(APP._lastRoom || null); else APP.toBirdsEye();
+    if (v === 'walk') APP.toGround(APP._lastRoom || null); else if (v === 'lobby') APP.toLobby(); else APP.toBirdsEye();
   }));
   document.getElementById('homeBtn').addEventListener('click', () => { APP.homeView(); markView('orbit'); selected && selectRoom(selected, false); });
 
