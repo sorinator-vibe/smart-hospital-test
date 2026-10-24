@@ -38,9 +38,9 @@
 }
 *{ box-sizing:border-box; }
 html,body{ margin:0; height:100%; overflow:hidden; background:#0a0d11; font-family:var(--sans); color:var(--ink); -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums; }
-body{ font-size:14px; background: radial-gradient(120% 90% at 50% 18%, #3a434f 0%, #232a32 44%, #0e1217 100%); }
+body{ font-size:14px; background:#1f252d; }   /* flat studio backdrop behind the transparent canvas: no radial falloff, no oval */
 #scene{ position:fixed; inset:0; width:100vw; height:100vh; display:block; touch-action:none; }
-#vignette{ position:fixed; inset:0; pointer-events:none; box-shadow: inset 0 0 200px 40px rgba(0,0,0,0.28); }
+#vignette{ position:fixed; inset:0; pointer-events:none; box-shadow:none; }   /* no edge vignette, in any mode */
 #hud{ position:fixed; inset:0; pointer-events:none; z-index:10; }
 #hud > *{ pointer-events:auto; }
 button{ font-family:var(--sans); cursor:pointer; color:inherit; font-size:inherit; }
@@ -348,15 +348,20 @@ body.walk #streetNav{ display:flex; }
 #alarmBanner .ab-t{ font-size:14px; font-weight:700; color:var(--busy); }
 #alarmBanner .ab-s{ font-size:12px; color:var(--ink-2); margin-top:1px; }
 
-/* fire-drill full-layout wash (kept: the one deliberately dramatic effect) */
-#fireWash{ position:fixed; inset:0; pointer-events:none; z-index:8; opacity:0; transition:opacity .5s ease;
-  background: radial-gradient(120% 100% at 50% 30%, rgba(255,40,55,0) 38%, rgba(190,16,28,0.30) 78%, rgba(120,4,12,0.52) 100%);
-  box-shadow: inset 0 0 260px 90px rgba(190,18,28,0.55); }
-#fireWash::before{ content:""; position:absolute; inset:0; background:rgba(214,30,42,0.10); animation:firePulse 1.25s ease-in-out infinite; }
-@keyframes firePulse{ 0%,100%{ opacity:.25; } 50%{ opacity:.7; } }
-.fw-bar{ position:absolute; left:50%; top:96px; transform:translateX(-50%); display:flex; align-items:center; gap:9px; font-size:13.5px; font-weight:700; color:#fff; background:var(--busy); border:0; border-radius:999px; padding:9px 18px; box-shadow:var(--shadow-2); white-space:nowrap; }
-.fw-bar .fw-dot{ width:9px; height:9px; border-radius:50%; background:#fff; animation:pulse 0.9s infinite; }
-body.fire-drill #fireWash{ opacity:1; }
+/* fire drill: a plain red strobe across the whole viewport — the alarm flash everyone knows, kept soft.
+   Tune with the variables below: colour, floor and peak opacity, and the period of one flash. */
+:root{ --fire-color:#d62828; --fire-min:0.08; --fire-max:0.26; --fire-period:1.4s; }
+#fireWash{ position:fixed; inset:0; pointer-events:none; z-index:8; background:var(--fire-color); opacity:0; }
+body.drill-active #fireWash{ animation:fireStrobe var(--fire-period) ease-in-out infinite; }
+@keyframes fireStrobe{ 0%,100%{ opacity:var(--fire-min); } 50%{ opacity:var(--fire-max); } }
+@media (prefers-reduced-motion: reduce){ body.drill-active #fireWash{ animation:none; opacity:var(--fire-max); } }
+/* the studio backdrop around the floor turns red too, so the flash reads edge to edge instead of as a light oval on black */
+body.drill-active{ background:#5a2320; transition:background .4s; }   /* deep red backdrop during the drill */
+.fw-bar{ position:fixed; left:50%; top:140px; transform:translateX(-50%) translateY(-8px); opacity:0; pointer-events:none; transition:opacity .5s ease, transform .5s ease; z-index:9; display:flex; align-items:center; gap:9px; font-size:13.5px; font-weight:700; color:#fff; background:var(--busy); border:0; border-radius:999px; padding:9px 18px; box-shadow:var(--shadow-2); white-space:nowrap; cursor:pointer; }
+.fw-bar .fw-dot{ width:9px; height:9px; border-radius:50%; background:#fff; animation:pulse 1.4s ease-in-out infinite; }
+.fw-bar small{ font-weight:400; opacity:.85; margin-left:4px; }
+.fw-bar:hover{ background:#9f1f17; }
+body.drill-active .fw-bar{ opacity:1; transform:translateX(-50%) translateY(0); pointer-events:auto; }
 
 /* ================= Human interactions pane ================= */
 #panel-care{ --care:#5b46b8; }
@@ -511,9 +516,8 @@ body.fire-drill #fireWash{ opacity:1; }
   <canvas id="scene"></canvas>
   <div id="vignette"></div>
   <!-- full-layout fire-drill wash -->
-  <div id="fireWash" aria-hidden="true">
-    <div class="fw-bar"><span class="fw-dot"></span>Fire drill in progress — fleet held, evacuation routes active</div>
-  </div>
+  <div id="fireWash" aria-hidden="true"></div>
+  <div class="fw-bar" id="fwBar" role="button" title="End the fire drill"><span class="fw-dot"></span>Fire drill in progress — fleet held, evacuation routes active <small>· tap to end drill</small></div>
 
   <!-- boot progress -->
   <div id="boot" role="status"><b>Smart hospital</b><span>Building the surgical floor</span><em><i></i></em></div>
@@ -6562,11 +6566,12 @@ window.APP = (function () {
   // ---------- fire drill (replaces L2/L3 switch) ----------
   let fireOn = false;
   const fireBtn = document.getElementById('fireDrill');
+  const fwBar = document.getElementById('fwBar'); if (fwBar) fwBar.addEventListener('click', () => { if (document.body.classList.contains('drill-active')) fireBtn.click(); });
   function setFireDrill(on) {
     fireOn = on;
     fireBtn.classList.toggle('active', on);
     fireBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    document.body.classList.toggle('fire-drill', on);
+    document.body.classList.toggle('drill-active', on);
     setPausedUI(on);                       // hold / resume the whole fleet in place
     if (on) {
       const a = (APP.fleet && APP.fleet.triggerRandomAlarm) ? APP.fleet.triggerRandomAlarm() : null;
@@ -7329,9 +7334,10 @@ window.APP = (function () {
       window.dispatchEvent(new CustomEvent('rtls:event', { detail: ev }));
     },
     alarmFlash() {
-      const v = document.getElementById('vignette'); if (!v) return;
-      v.style.transition = 'box-shadow .22s'; v.style.boxShadow = 'inset 0 0 240px 72px rgba(220,40,60,0.5)';
-      clearTimeout(this._afl); this._afl = setTimeout(() => { if (!this.effects.fire) v.style.boxShadow = ''; }, 380);
+      // brief flat red flash across the whole frame (no edge vignette); during a drill the strobe keeps control
+      const w = document.getElementById('fireWash'); if (!w) return;
+      w.style.transition = 'opacity .2s'; w.style.opacity = '0.28';
+      clearTimeout(this._afl); this._afl = setTimeout(() => { w.style.opacity = ''; }, 380);
     },
     getCarts() { return this.robots.filter(r => r.cart).map(r => ({ id: r.cart.id, robot: r.id, state: r.cart.state })); },
     getAlarms() { return this.alarms; },
@@ -7511,8 +7517,7 @@ window.APP = (function () {
     },
     setFire(on) {
       this.fireFX.visible = on; this.effects.fire = on;
-      document.getElementById('vignette').style.transition = 'box-shadow .6s';
-      document.getElementById('vignette').style.boxShadow = on ? 'inset 0 0 240px 80px rgba(180,20,20,0.5)' : 'inset 0 0 240px 60px rgba(0,0,0,0.55)';
+      // no red vignette: the drill is shown as a gentle breathing colour grade (#fireWash) plus the alarm dome
       if (on) { for (const r of this.robots) { if (r.state === 'carrying' || r.state === 'return') { r.returnHome(); r.amr.setStatus(COL.evac); r.flash('⚠ EVAC', COL.evac); } } }
       else { for (const r of this.robots) r.amr.setStatus(r.state === 'carrying' ? COL.carrying : COL.idle); }
     },
