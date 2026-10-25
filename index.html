@@ -9765,9 +9765,9 @@ window.HOSP = window.HOSP || {};
   _rawmat(c, r, m) { return new THREE.MeshStandardMaterial({ color: c, roughness: r ?? 0.6, metalness: m ?? 0.1 }); }
   _sph(r, m, sx, sy, sz) { const o = new THREE.Mesh(new THREE.SphereGeometry(r, 18, 14), m); if (sx != null) o.scale.set(sx, sy, sz); o.castShadow = true; return o; }
   _led(c, i) { return this._emat(c, (i ?? 0.8) * 1.4); }
-  _rbox(w, h, d, r, m) {
-    // rounded box, centred like BoxGeometry; geometries cached by size
-    const key = [w, h, d, r].map(v => (+v).toFixed(3)).join(',');
+  _rbox(w, h, d, r, m, lo) {
+    // rounded box, centred like BoxGeometry; geometries cached by size (lo = low-poly corners for small rig parts)
+    const key = [w, h, d, r].map(v => (+v).toFixed(3)).join(',') + (lo ? 'L' : '');
     this._rboxCache = this._rboxCache || {};
     let geo = this._rboxCache[key];
     if (!geo) {
@@ -9778,7 +9778,7 @@ window.HOSP = window.HOSP || {};
       const s = new THREE.Shape();
       s.moveTo(-hw + rr, -hd); s.lineTo(hw - rr, -hd); s.quadraticCurveTo(hw, -hd, hw, -hd + rr); s.lineTo(hw, hd - rr); s.quadraticCurveTo(hw, hd, hw - rr, hd);
       s.lineTo(-hw + rr, hd); s.quadraticCurveTo(-hw, hd, -hw, hd - rr); s.lineTo(-hw, -hd + rr); s.quadraticCurveTo(-hw, -hd, -hw + rr, -hd);
-      geo = new THREE.ExtrudeGeometry(s, { depth: Math.max(0.001, h - 2 * bt), bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelSegments: 3, curveSegments: 8 });
+      geo = new THREE.ExtrudeGeometry(s, { depth: Math.max(0.001, h - 2 * bt), bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelSegments: lo ? 1 : 3, curveSegments: lo ? 3 : 8 });
       geo.rotateX(-Math.PI / 2); geo.translate(0, bt - h / 2, 0);
       this._rboxCache[key] = geo;
     }
@@ -9795,6 +9795,33 @@ window.HOSP = window.HOSP || {};
   // Original designs informed by current humanoids (2025-26): ~1.75-1.8 m bipeds with all-electric joints,
   // slim forearm-actuated hands, an optional washable soft-goods covering, a sealed wet-area build,
   // a reverse-knee tote runner, and wheeled humanoids with telescoping torsos. Scene scale ≈ 1.55 u per metre.
+  // ---- performance helpers: low-poly shapes + static batching of rigid parts ----
+  _rboxL(w, h, d, r, m) { return this._rbox(w, h, d, r, m, true); }
+  _rcL(r, len, bev, m, seg) { return this._roundCyl(r, len, bev, m, Math.min(seg || 40, 18)); }
+  _mergeMeshes(list) {
+    const parts = list.map(x => { x.updateMatrix(); const g = x.geometry.index ? x.geometry.toNonIndexed() : x.geometry.clone(); g.applyMatrix4(x.matrix); return g; });
+    let n = 0; parts.forEach(g => { n += g.attributes.position.count; });
+    const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), uv = new Float32Array(n * 2); let o = 0;
+    parts.forEach(g => { pos.set(g.attributes.position.array, o * 3); if (g.attributes.normal) nor.set(g.attributes.normal.array, o * 3); if (g.attributes.uv) uv.set(g.attributes.uv.array, o * 2); o += g.attributes.position.count; g.dispose(); });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3)); geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    geo.computeBoundingSphere();
+    return new THREE.Mesh(geo, list[0].material);
+  }
+  // merge every rigid leaf mesh that shares a parent and a material (joints stay separate groups, so animation is untouched)
+  _batch(root) {
+    const nodes = []; root.traverse(o => nodes.push(o));
+    nodes.forEach(node => {
+      const by = new Map();
+      node.children.forEach(ch => { if (ch.isMesh && !ch.children.length && !ch.userData.noMerge && ch.visible) { if (!by.has(ch.material)) by.set(ch.material, []); by.get(ch.material).push(ch); } });
+      by.forEach(list => {
+        if (list.length < 2) return;
+        const mesh = this._mergeMeshes(list); mesh.castShadow = list.some(x => x.castShadow); mesh.receiveShadow = list.some(x => x.receiveShadow);
+        list.forEach(x => node.remove(x)); node.add(mesh);
+      });
+    });
+    return root;
+  }
   _knitTex() {
     if (this._knit) return this._knit;
     const c = document.createElement('canvas'); c.width = c.height = 128; const x = c.getContext('2d');
@@ -9826,7 +9853,7 @@ window.HOSP = window.HOSP || {};
   // tapered limb along -Y (0..-len), radius r0 at the top, r1 at the bottom
   _limb(r0, r1, len, m, seg) {
     const pts = [new THREE.Vector2(0, 0), new THREE.Vector2(r0 * 0.92, 0), new THREE.Vector2(r0, -len * 0.08), new THREE.Vector2((r0 + r1) / 2 * 1.02, -len * 0.5), new THREE.Vector2(r1, -len * 0.92), new THREE.Vector2(r1 * 0.9, -len), new THREE.Vector2(0, -len)];
-    const o = new THREE.Mesh(new THREE.LatheGeometry(pts, seg || 28), m); o.castShadow = true; return o;
+    const o = new THREE.Mesh(new THREE.LatheGeometry(pts, Math.min(seg || 28, 16)), m); o.castShadow = true; return o;
   }
   _bellows(parent, r, y, n, m) { for (let i = 0; i < n; i++) { const t = new THREE.Mesh(new THREE.TorusGeometry(r, r * 0.16, 8, 28), m); t.rotation.x = Math.PI / 2; t.position.y = y - i * r * 0.32; parent.add(t); } }
 
@@ -9835,35 +9862,25 @@ window.HOSP = window.HOSP || {};
     const T = THREE, g = new T.Group(); s = s || 1;
     const fingers = [];
     if (kind === 'paddle') {                                                       // reverse-knee runner: two-finger tote paddles
-      const palm = this._rbox(0.12 * s, 0.1 * s, 0.06 * s, 0.02, M.shell2); palm.position.y = -0.05 * s; g.add(palm);
+      const palm = this._rboxL(0.12 * s, 0.1 * s, 0.06 * s, 0.02, M.shell2); palm.position.y = -0.05 * s; g.add(palm);
       for (const fx of [-1, 1]) {
         const f = new T.Group(); f.position.set(0, -0.1 * s, fx * 0.02 * s); g.add(f);
-        const p = this._rbox(0.11 * s, 0.13 * s, 0.025 * s, 0.01, M.joint); p.position.y = -0.065 * s; f.add(p);
-        const pad = this._rbox(0.1 * s, 0.07 * s, 0.008, 0.004, M.rubber); pad.position.set(0, -0.09 * s, -fx * 0.016 * s); f.add(pad);
+        const p = this._rboxL(0.11 * s, 0.13 * s, 0.025 * s, 0.01, M.joint); p.position.y = -0.065 * s; f.add(p);
+        const pad = this._rboxL(0.1 * s, 0.07 * s, 0.008, 0.004, M.rubber); pad.position.set(0, -0.09 * s, -fx * 0.016 * s); f.add(pad);
         fingers.push({ segs: [f], sign: fx, paddle: true });
       }
       return { g, fingers, set: (gr) => fingers.forEach(f => { f.segs[0].rotation.x = -f.sign * gr * 0.35; }) };
     }
-    const palm = this._rbox(0.1 * s, 0.13 * s, 0.046 * s, 0.018 * s, M.dark); palm.position.y = -0.07 * s; palm.castShadow = true; g.add(palm);
-    const back = this._rbox(0.092 * s, 0.1 * s, 0.012 * s, 0.006, M.trim); back.position.set(0, -0.065 * s, -0.026 * s); g.add(back);
-    const lens = [[0.05, 0.034, 0.028], [0.056, 0.038, 0.03], [0.053, 0.036, 0.029], [0.044, 0.03, 0.025]];
-    [-0.036, -0.012, 0.012, 0.036].forEach((fx, i) => {
-      let par = g, y0 = -0.14 * s; const segs = [];
-      lens[i].forEach((L, k) => {
-        const j = new T.Group(); j.position.set(k ? 0 : fx * s * sd, k ? -lens[i][k - 1] * s : y0, 0); par.add(j);
-        const b = this._rbox(0.021 * s, L * s, 0.024 * s, 0.009 * s, k === 2 ? M.rubber : M.joint); b.position.y = -L * s / 2; j.add(b);
-        segs.push(j); par = j;
-      });
-      fingers.push({ segs });
-    });
-    // opposable thumb
+    // fingers: two fused rows (proximal, distal) that curl as units + one-piece thumb — reads as five fingers at a fraction of the cost
+    const palm = this._rboxL(0.1 * s, 0.13 * s, 0.046 * s, 0.018 * s, M.dark); palm.position.y = -0.07 * s; g.add(palm);
+    const back = this._rboxL(0.092 * s, 0.1 * s, 0.012 * s, 0.006, M.trim); back.position.set(0, -0.065 * s, -0.026 * s); g.add(back);
+    const fxs = [-0.036, -0.012, 0.012, 0.036].map(v => v * s * sd), pl = [0.05, 0.056, 0.053, 0.044], dl = [0.058, 0.066, 0.062, 0.05];
+    const row = (lens, mat) => this._mergeMeshes(fxs.map((x, i) => { const b = this._rboxL(0.021 * s, lens[i] * s, 0.024 * s, 0.009 * s, mat); b.position.set(x, -lens[i] * s / 2, 0); return b; }));
+    const prox = new T.Group(); prox.position.y = -0.14 * s; g.add(prox); prox.add(row(pl, M.joint));
+    const dist = new T.Group(); dist.position.y = -0.05 * s; prox.add(dist); dist.add(row(dl, M.rubber));
     const th = new T.Group(); th.position.set(sd * 0.05 * s, -0.045 * s, 0.018 * s); th.rotation.set(0.5, 0, -sd * 0.7); g.add(th);
-    let par = th; const tsegs = [];
-    [0.04, 0.033, 0.026].forEach((L, k) => { const j = new T.Group(); j.position.y = k ? -[0.04, 0.033][k - 1] * s : 0; par.add(j); const b = this._rbox(0.023 * s, L * s, 0.024 * s, 0.009 * s, k === 2 ? M.rubber : M.joint); b.position.y = -L * s / 2; j.add(b); tsegs.push(j); par = j; });
-    const set = (gr) => {
-      fingers.forEach((f, i) => { f.segs[0].rotation.x = -(0.15 + gr * 1.05); f.segs[1].rotation.x = -(0.2 + gr * 1.0); f.segs[2].rotation.x = -(0.12 + gr * 0.7); });
-      tsegs[1].rotation.x = -(0.1 + gr * 0.6); tsegs[2].rotation.x = -(0.1 + gr * 0.5);
-    };
+    const thb = this._rboxL(0.023 * s, 0.075 * s, 0.024 * s, 0.009 * s, M.joint); thb.position.y = -0.0375 * s; th.add(thb);
+    const set = (gr) => { prox.rotation.x = -(0.15 + gr * 1.05); dist.rotation.x = -(0.3 + gr * 1.5); th.rotation.x = 0.5 + gr * 0.5; };
     set(0.2);
     return { g, fingers, set };
   }
@@ -9871,18 +9888,18 @@ window.HOSP = window.HOSP || {};
   _humArm(parent, sd, D, M, style) {
     const T = THREE, S = new T.Group(); S.position.set(sd * D.shX, D.shY, 0); parent.add(S);
     const big = style === 'vega' || style === 'galbot';
-    const sAct = this._roundCyl(big ? 0.1 : 0.088, 0.17, 0.03, M.joint, 32); sAct.rotation.z = Math.PI / 2; S.add(sAct);
-    const cap = this._roundCyl(big ? 0.105 : 0.092, 0.06, 0.02, M.shell, 32); cap.rotation.z = Math.PI / 2; cap.position.x = sd * 0.1; S.add(cap);
+    const sAct = this._rcL(big ? 0.1 : 0.088, 0.17, 0.03, M.joint, 32); sAct.rotation.z = Math.PI / 2; S.add(sAct);
+    const cap = this._rcL(big ? 0.105 : 0.092, 0.06, 0.02, M.shell, 32); cap.rotation.z = Math.PI / 2; cap.position.x = sd * 0.1; S.add(cap);
     S.add(this._limb(big ? 0.082 : 0.075, big ? 0.064 : 0.058, D.upper, M.shell));
     if (style === 'soft') { const sl = this._limb(0.083, 0.066, D.upper * 0.7, M.shell2); sl.position.y = -0.04; S.add(sl); }
     const E = new T.Group(); E.position.y = -D.upper; S.add(E);
-    const eAct = this._roundCyl(big ? 0.075 : 0.066, 0.13, 0.025, M.joint, 28); eAct.rotation.z = Math.PI / 2; E.add(eAct);
+    const eAct = this._rcL(big ? 0.075 : 0.066, 0.13, 0.025, M.joint, 28); eAct.rotation.z = Math.PI / 2; E.add(eAct);
     if (style === 'sealed') this._bellows(E, 0.066, 0.03, 3, M.joint);
     // forearm: fuller near the elbow where the finger actuators live, slim at the wrist
     E.add(this._limb(big ? 0.074 : 0.066, big ? 0.05 : 0.044, D.fore, M.shell));
-    const stripe = this._rbox(0.012, D.fore * 0.45, 0.03, 0.005, M.acc); stripe.position.set(sd * 0.064, -D.fore * 0.35, 0); E.add(stripe);
+    const stripe = this._rboxL(0.012, D.fore * 0.45, 0.03, 0.005, M.acc); stripe.position.set(sd * 0.064, -D.fore * 0.35, 0); E.add(stripe);
     const W = new T.Group(); W.position.y = -D.fore; E.add(W);
-    const cuff = this._roundCyl(0.046, 0.04, 0.012, M.joint, 24); cuff.position.y = -0.01; W.add(cuff);
+    const cuff = this._rcL(0.046, 0.04, 0.012, M.joint, 24); cuff.position.y = -0.01; W.add(cuff);
     const hand = this._humHand(sd, M, style === 'bird' ? 'paddle' : 'five', big ? 1.15 : 1);
     hand.g.position.y = -0.03; W.add(hand.g);
     return { S, E, W, hand, sd, L1: D.upper, L2: D.fore };
@@ -9890,20 +9907,20 @@ window.HOSP = window.HOSP || {};
 
   _humLeg(pelvis, sd, D, M, style) {
     const T = THREE, H = new T.Group(); H.position.set(sd * D.hipX, -0.04, 0); pelvis.add(H);
-    const hAct = this._roundCyl(0.1, 0.17, 0.03, M.joint, 32); hAct.rotation.z = Math.PI / 2; H.add(hAct);
+    const hAct = this._rcL(0.1, 0.17, 0.03, M.joint, 32); hAct.rotation.z = Math.PI / 2; H.add(hAct);
     H.add(this._limb(0.1, 0.075, D.thigh, M.shell, 30));
-    const tc = this._rbox(0.14, D.thigh * 0.55, 0.06, 0.03, M.shell2); tc.position.set(0, -D.thigh * 0.42, 0.075); H.add(tc);
+    const tc = this._rboxL(0.14, D.thigh * 0.55, 0.06, 0.03, M.shell2); tc.position.set(0, -D.thigh * 0.42, 0.075); H.add(tc);
     const K = new T.Group(); K.position.y = -D.thigh; H.add(K);
-    const kAct = this._roundCyl(0.082, 0.15, 0.025, M.joint, 28); kAct.rotation.z = Math.PI / 2; K.add(kAct);
+    const kAct = this._rcL(0.082, 0.15, 0.025, M.joint, 28); kAct.rotation.z = Math.PI / 2; K.add(kAct);
     if (style === 'sealed') this._bellows(K, 0.08, 0.04, 3, M.joint);
     K.add(this._limb(0.078, 0.052, D.shin, M.shell, 28));
-    const calf = this._rbox(0.12, D.shin * 0.5, 0.07, 0.03, M.shell2); calf.position.set(0, -D.shin * 0.3, D.bird ? 0.07 : -0.06); K.add(calf);
+    const calf = this._rboxL(0.12, D.shin * 0.5, 0.07, 0.03, M.shell2); calf.position.set(0, -D.shin * 0.3, D.bird ? 0.07 : -0.06); K.add(calf);
     const A = new T.Group(); A.position.y = -D.shin; K.add(A);
-    const aAct = this._roundCyl(0.05, 0.11, 0.015, M.joint, 24); aAct.rotation.z = Math.PI / 2; A.add(aAct);
+    const aAct = this._rcL(0.05, 0.11, 0.015, M.joint, 24); aAct.rotation.z = Math.PI / 2; A.add(aAct);
     const foot = new T.Group(); A.add(foot);
     const fl = D.footL;
-    const sole = this._rbox(0.15, 0.035, fl, 0.05, M.rubber); sole.position.set(0, -D.ankleH + 0.0175, fl * 0.2); foot.add(sole);
-    const upperF = this._rbox(0.13, D.ankleH - 0.03, fl * 0.78, 0.045, M.shell2); upperF.position.set(0, -D.ankleH / 2 + 0.015, fl * 0.14); upperF.castShadow = true; foot.add(upperF);
+    const sole = this._rboxL(0.15, 0.035, fl, 0.05, M.rubber); sole.position.set(0, -D.ankleH + 0.0175, fl * 0.2); foot.add(sole);
+    const upperF = this._rboxL(0.13, D.ankleH - 0.03, fl * 0.78, 0.045, M.shell2); upperF.position.set(0, -D.ankleH / 2 + 0.015, fl * 0.14); upperF.castShadow = true; foot.add(upperF);
     return { H, K, A, foot, sd, L1: D.thigh, L2: D.shin };
   }
 
@@ -9911,45 +9928,45 @@ window.HOSP = window.HOSP || {};
   _humUpper(waist, style, D, M) {
     const T = THREE;
     const big = style === 'vega' || style === 'galbot';
-    const abd = this._rbox(big ? 0.4 : 0.34, 0.26, big ? 0.28 : 0.24, 0.1, style === 'soft' ? M.shell2 : M.joint); abd.position.y = 0.16; waist.add(abd);
-    const chest = this._rbox(big ? 0.62 : 0.54, 0.42, big ? 0.36 : 0.31, 0.13, M.shell); chest.position.y = 0.47; chest.castShadow = true; waist.add(chest);
-    const yoke = this._rbox(big ? 0.78 : 0.68, 0.12, big ? 0.3 : 0.26, 0.06, M.shell2); yoke.position.y = D.shY + 0.01; waist.add(yoke);
-    const pack = this._rbox(0.36, 0.42, 0.1, 0.04, M.shell2); pack.position.set(0, 0.45, -(big ? 0.21 : 0.19)); waist.add(pack);
-    const vent = this._rbox(0.24, 0.025, 0.012, 0.006, M.dark); for (let i = 0; i < 4; i++) { const v = vent.clone(); v.position.set(0, 0.33 + i * 0.05, -(big ? 0.265 : 0.245)); waist.add(v); }
+    const abd = this._rboxL(big ? 0.4 : 0.34, 0.26, big ? 0.28 : 0.24, 0.1, style === 'soft' ? M.shell2 : M.joint); abd.position.y = 0.16; waist.add(abd);
+    const chest = this._rboxL(big ? 0.62 : 0.54, 0.42, big ? 0.36 : 0.31, 0.13, M.shell); chest.position.y = 0.47; chest.castShadow = true; waist.add(chest);
+    const yoke = this._rboxL(big ? 0.78 : 0.68, 0.12, big ? 0.3 : 0.26, 0.06, M.shell2); yoke.position.y = D.shY + 0.01; waist.add(yoke);
+    const pack = this._rboxL(0.36, 0.42, 0.1, 0.04, M.shell2); pack.position.set(0, 0.45, -(big ? 0.21 : 0.19)); waist.add(pack);
+    const vent = this._rboxL(0.24, 0.025, 0.012, 0.006, M.dark); for (let i = 0; i < 4; i++) { const v = vent.clone(); v.position.set(0, 0.33 + i * 0.05, -(big ? 0.265 : 0.245)); waist.add(v); }
     const fz = big ? 0.181 : 0.156;
-    if (style === 'soft') { const seam = this._rbox(0.012, 0.36, 0.006, 0.003, M.trim); seam.position.set(0, 0.45, fz + 0.004); waist.add(seam); }
-    else if (style === 'sealed') { const plate = this._rbox(0.36, 0.22, 0.02, 0.05, M.shell2); plate.position.set(0, 0.5, fz + 0.006); waist.add(plate); }
-    const strip = this._rbox(style === 'bird' ? 0.18 : 0.22, 0.022, 0.01, 0.006, M.acc); strip.position.set(0, 0.62, fz + 0.01); waist.add(strip);
+    if (style === 'soft') { const seam = this._rboxL(0.012, 0.36, 0.006, 0.003, M.trim); seam.position.set(0, 0.45, fz + 0.004); waist.add(seam); }
+    else if (style === 'sealed') { const plate = this._rboxL(0.36, 0.22, 0.02, 0.05, M.shell2); plate.position.set(0, 0.5, fz + 0.006); waist.add(plate); }
+    const strip = this._rboxL(style === 'bird' ? 0.18 : 0.22, 0.022, 0.01, 0.006, M.acc); strip.position.set(0, 0.62, fz + 0.01); waist.add(strip);
     this._anim.pulsers.push({ mat: M.acc, base: 0.9, amp: 0.3, spd: 1.4 + Math.random() * 0.4 });
     const arms = { L: this._humArm(waist, 1, D, M, style), R: this._humArm(waist, -1, D, M, style) };
     const neck = new T.Group(); neck.position.y = D.neckY; waist.add(neck);
-    const nk = this._roundCyl(0.058, 0.12, 0.02, M.joint, 24); nk.position.y = 0.02; neck.add(nk);
+    const nk = this._rcL(0.058, 0.12, 0.02, M.joint, 24); nk.position.y = 0.02; neck.add(nk);
     const head = new T.Group(); head.position.y = 0.1; neck.add(head);
     if (style === 'soft') {
       const skull = this._sph(0.15, M.trim, 0.92, 1.12, 1.0); skull.position.y = 0.12; head.add(skull);
       const face = new T.Mesh(new T.SphereGeometry(0.152, 28, 18, -0.75, 1.5, 0.95, 0.9), M.visor); face.position.y = 0.12; face.scale.set(0.92, 1.12, 1.0); head.add(face);
-      for (const ex of [-0.045, 0.045]) { const e = this._rbox(0.034, 0.012, 0.01, 0.004, M.acc); e.position.set(ex, 0.13, 0.15); head.add(e); }
+      for (const ex of [-0.045, 0.045]) { const e = this._rboxL(0.034, 0.012, 0.01, 0.004, M.acc); e.position.set(ex, 0.13, 0.15); head.add(e); }
     } else if (style === 'sealed') {
-      const skull = this._rbox(0.27, 0.27, 0.29, 0.1, M.shell); skull.position.y = 0.12; skull.castShadow = true; head.add(skull);
-      const bar = this._rbox(0.25, 0.06, 0.03, 0.02, M.visor); bar.position.set(0, 0.14, 0.145); head.add(bar);
-      const led = this._rbox(0.14, 0.012, 0.006, 0.003, M.acc); led.position.set(0, 0.14, 0.161); head.add(led);
-      const crest = this._rbox(0.06, 0.03, 0.22, 0.012, M.shell2); crest.position.set(0, 0.265, 0); head.add(crest);
+      const skull = this._rboxL(0.27, 0.27, 0.29, 0.1, M.shell); skull.position.y = 0.12; skull.castShadow = true; head.add(skull);
+      const bar = this._rboxL(0.25, 0.06, 0.03, 0.02, M.visor); bar.position.set(0, 0.14, 0.145); head.add(bar);
+      const led = this._rboxL(0.14, 0.012, 0.006, 0.003, M.acc); led.position.set(0, 0.14, 0.161); head.add(led);
+      const crest = this._rboxL(0.06, 0.03, 0.22, 0.012, M.shell2); crest.position.set(0, 0.265, 0); head.add(crest);
     } else if (style === 'bird') {
-      const skull = this._rbox(0.3, 0.16, 0.22, 0.06, M.shell); skull.position.y = 0.07; head.add(skull);
+      const skull = this._rboxL(0.3, 0.16, 0.22, 0.06, M.shell); skull.position.y = 0.07; head.add(skull);
       for (const ex of [-0.07, 0.07]) { const cam = this._cyl(0.026, 0.026, 0.02, M.visor, 16); cam.rotation.x = Math.PI / 2; cam.position.set(ex, 0.08, 0.115); head.add(cam); }
-      const led = this._rbox(0.2, 0.012, 0.006, 0.003, M.acc); led.position.set(0, 0.025, 0.112); head.add(led);
+      const led = this._rboxL(0.2, 0.012, 0.006, 0.003, M.acc); led.position.set(0, 0.025, 0.112); head.add(led);
     } else if (style === 'galbot') {
       const skull = this._sph(0.2, M.shell, 1, 0.9, 1); skull.position.y = 0.16; head.add(skull);
       const vis = new T.Mesh(new T.SphereGeometry(0.202, 28, 14, -0.9, 1.8, 1.05, 0.7), M.visor); vis.scale.set(1, 0.9, 1); vis.position.y = 0.16; head.add(vis);
       for (const ex of [-0.06, 0.06]) { const e = this._cyl(0.018, 0.018, 0.012, M.acc, 12); e.rotation.x = Math.PI / 2; e.position.set(ex, 0.17, 0.196); head.add(e); }
     } else if (style === 'vega') {
-      const skull = this._rbox(0.4, 0.22, 0.28, 0.1, M.shell); skull.position.y = 0.12; skull.castShadow = true; head.add(skull);
-      const vis = this._rbox(0.34, 0.1, 0.03, 0.04, M.visor); vis.position.set(0, 0.12, 0.14); head.add(vis);
+      const skull = this._rboxL(0.4, 0.22, 0.28, 0.1, M.shell); skull.position.y = 0.12; skull.castShadow = true; head.add(skull);
+      const vis = this._rboxL(0.34, 0.1, 0.03, 0.04, M.visor); vis.position.set(0, 0.12, 0.14); head.add(vis);
       for (const ex of [-0.09, 0.09]) { const e = this._cyl(0.022, 0.022, 0.012, M.acc, 12); e.rotation.x = Math.PI / 2; e.position.set(ex, 0.12, 0.158); head.add(e); }
     } else {
-      const skull = this._rbox(0.25, 0.3, 0.27, 0.11, M.shell); skull.position.y = 0.13; skull.castShadow = true; head.add(skull);
-      const vis = this._rbox(0.22, 0.13, 0.03, 0.05, M.visor); vis.position.set(0, 0.14, 0.135); head.add(vis);
-      const led = this._rbox(0.12, 0.01, 0.006, 0.003, M.acc); led.position.set(0, 0.095, 0.152); head.add(led);
+      const skull = this._rboxL(0.25, 0.3, 0.27, 0.11, M.shell); skull.position.y = 0.13; skull.castShadow = true; head.add(skull);
+      const vis = this._rboxL(0.22, 0.13, 0.03, 0.05, M.visor); vis.position.set(0, 0.14, 0.135); head.add(vis);
+      const led = this._rboxL(0.12, 0.01, 0.006, 0.003, M.acc); led.position.set(0, 0.095, 0.152); head.add(led);
     }
     head.traverse(o => { if (o.isMesh) o.castShadow = true; });
     return { arms, neck, head };
@@ -9961,11 +9978,12 @@ window.HOSP = window.HOSP || {};
     const T = THREE, M = this._humMats(style, accent), D = this._humDims(style);
     const root = new T.Group();
     const pelvis = new T.Group(); pelvis.position.y = D.stand; root.add(pelvis);
-    const pv = this._rbox(0.44, 0.22, 0.29, 0.09, M.shell2); pv.position.y = 0.02; pv.castShadow = true; pelvis.add(pv);
+    const pv = this._rboxL(0.44, 0.22, 0.29, 0.09, M.shell2); pv.position.y = 0.02; pv.castShadow = true; pelvis.add(pv);
     const legs = { L: this._humLeg(pelvis, 1, D, M, style), R: this._humLeg(pelvis, -1, D, M, style) };
     const waist = new T.Group(); waist.position.y = 0.13; pelvis.add(waist);
-    const wj = this._roundCyl(0.12, 0.12, 0.03, M.joint, 32); wj.position.y = 0.03; waist.add(wj);
+    const wj = this._rcL(0.12, 0.12, 0.03, M.joint, 32); wj.position.y = 0.03; waist.add(wj);
     const up = this._humUpper(waist, style, D, M);
+    this._batch(root);
     root.userData.rig = { kind: 'biped', style, root, pelvis, waist, neck: up.neck, head: up.head, arms: up.arms, legs, D, M };
     return root;
   }
@@ -9978,28 +9996,29 @@ window.HOSP = window.HOSP || {};
     if (style === 'galbot') {
       const prof = [new T.Vector2(0.62, 0), new T.Vector2(0.78, 0.12), new T.Vector2(0.8, 0.3), new T.Vector2(0.74, 0.46), new T.Vector2(0.56, 0.56), new T.Vector2(0, 0.58)];
       const base = new T.Mesh(new T.LatheGeometry(prof, 48), M.shell2); base.castShadow = true; root.add(base);
-      const band = this._roundCyl(0.795, 0.06, 0.02, M.dark, 48); band.position.y = 0.2; root.add(band);
+      const band = this._rcL(0.795, 0.06, 0.02, M.dark, 48); band.position.y = 0.2; root.add(band);
       const trim = new T.Mesh(new T.TorusGeometry(0.77, 0.022, 10, 64), M.acc); trim.rotation.x = Math.PI / 2; trim.position.y = 0.12; root.add(trim);
-      for (let i = 0; i < 3; i++) { const a = i * Math.PI * 2 / 3; const w = new T.Group(); w.position.set(Math.cos(a) * 0.5, 0.12, Math.sin(a) * 0.5); w.rotation.y = -a; root.add(w); const t = this._cyl(0.12, 0.12, 0.09, M.rubber, 18); t.rotation.z = Math.PI / 2; w.add(t); wheels.push({ g: t, r: 0.12, axis: 'x' }); }
-      const lidar = this._roundCyl(0.1, 0.1, 0.02, M.dark, 24); lidar.position.set(0, 0.63, 0.5); root.add(lidar);
+      for (let i = 0; i < 3; i++) { const a = i * Math.PI * 2 / 3; const w = new T.Group(); w.position.set(Math.cos(a) * 0.5, 0.12, Math.sin(a) * 0.5); w.rotation.y = -a; root.add(w); const t = this._cyl(0.12, 0.12, 0.09, M.rubber, 18); t.rotation.z = Math.PI / 2; t.userData.noMerge = true; w.add(t); wheels.push({ g: t, r: 0.12, axis: 'x' }); }
+      const lidar = this._rcL(0.1, 0.1, 0.02, M.dark, 24); lidar.position.set(0, 0.63, 0.5); root.add(lidar);
       baseTop = 0.58;
     } else {
-      const chassis = this._rbox(1.5, 0.26, 1.05, 0.3, M.dark); chassis.position.y = 0.26; root.add(chassis);
-      const deck = this._rbox(1.62, 0.34, 1.16, 0.36, M.shell); deck.position.y = 0.56; deck.castShadow = true; root.add(deck);
-      const deckTop = this._rbox(1.3, 0.08, 0.92, 0.26, M.shell2); deckTop.position.y = 0.77; root.add(deckTop);
+      const chassis = this._rboxL(1.5, 0.26, 1.05, 0.3, M.dark); chassis.position.y = 0.26; root.add(chassis);
+      const deck = this._rboxL(1.62, 0.34, 1.16, 0.36, M.shell); deck.position.y = 0.56; deck.castShadow = true; root.add(deck);
+      const deckTop = this._rboxL(1.3, 0.08, 0.92, 0.26, M.shell2); deckTop.position.y = 0.77; root.add(deckTop);
       for (const sx of [-0.76, 0.76]) { const w = new T.Group(); w.position.set(sx, 0.26, 0.1); root.add(w); const t = this._cyl(0.26, 0.26, 0.14, M.rubber, 28); t.rotation.z = Math.PI / 2; w.add(t); const hub = this._cyl(0.14, 0.14, 0.15, M.alu, 20); hub.rotation.z = Math.PI / 2; w.add(hub); wheels.push({ g: w, r: 0.26, axis: 'x' }); }
       for (const c of [[-0.5, -0.42], [0.5, -0.42], [-0.5, 0.44], [0.5, 0.44]]) { const cw = this._cyl(0.09, 0.09, 0.07, M.rubber, 12); cw.rotation.z = Math.PI / 2; cw.position.set(c[0], 0.09, c[1]); root.add(cw); }
-      const eStrip = this._rbox(0.7, 0.05, 0.04, 0.02, M.acc); eStrip.position.set(0, 0.62, 0.59); root.add(eStrip);
+      const eStrip = this._rboxL(0.7, 0.05, 0.04, 0.02, M.acc); eStrip.position.set(0, 0.62, 0.59); root.add(eStrip);
       const estop = this._cyl(0.05, 0.05, 0.05, this._rawmat(0xc0392b, 0.5, 0.1), 12); estop.position.set(0.55, 0.81, -0.35); root.add(estop);
       baseTop = 0.79;
     }
     // telescoping column: fixed sleeve + moving inner stage carrying the torso
-    const sleeve = this._roundCyl(style === 'galbot' ? 0.2 : 0.22, 0.62, 0.04, M.shell2, 32); sleeve.position.y = baseTop + 0.31; root.add(sleeve);
+    const sleeve = this._rcL(style === 'galbot' ? 0.2 : 0.22, 0.62, 0.04, M.shell2, 32); sleeve.position.y = baseTop + 0.31; root.add(sleeve);
     const lift = new T.Group(); lift.position.y = baseTop + 0.5; root.add(lift);
-    const inner = this._roundCyl(style === 'galbot' ? 0.15 : 0.17, 0.9, 0.03, M.joint, 32); inner.position.y = -0.38; lift.add(inner);
+    const inner = this._rcL(style === 'galbot' ? 0.15 : 0.17, 0.9, 0.03, M.joint, 32); inner.position.y = -0.38; lift.add(inner);
     const waist = new T.Group(); waist.position.y = 0.12; lift.add(waist);
-    const wj = this._roundCyl(0.17, 0.14, 0.03, M.joint, 32); wj.position.y = 0.0; waist.add(wj);
+    const wj = this._rcL(0.17, 0.14, 0.03, M.joint, 32); wj.position.y = 0.0; waist.add(wj);
     const up = this._humUpper(waist, style, D, M);
+    this._batch(root);
     root.userData.rig = { kind: 'wheel', style, root, lift, liftBase: baseTop + 0.5, waist, neck: up.neck, head: up.head, arms: up.arms, legs: null, wheels, D, M };
     return root;
   }
@@ -11346,5 +11365,121 @@ window.HOSP = window.HOSP || {};
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
 })();
 
+</script>
+<script>
+/* perf.js — render-cost trim, applied once the floor, fleets and people have booted.
+   1) Shadow trim: small parts (< 0.18 m), flat floor inlays/pads and see-through surfaces stop casting shadows,
+      so the shadow pass draws ~half the objects. Receiving shadows is unchanged.
+   2) Static batching of the building: inside each fixture, rigid leaf meshes that share a material, shadow flags and
+      click tag are merged into one draw. Lifts, overlays, labels, colliders and transparent surfaces stay untouched,
+      so lift doors, layer toggles, hover highlight and click-to-inspect all behave as before.
+   Exposes window.PERF.render = { before, after } with the counts. */
+(function () {
+  'use strict';
+  const KEEP_KINDS = new Set(['lift', 'lift-kiosk']);
+  const box = new THREE.Box3(), sv = new THREE.Vector3();
+
+  function count(root) { let m = 0, c = 0; root.traverse(o => { if (o.isMesh && o.visible) { m++; if (o.castShadow) c++; } }); return { meshes: m, shadowCasters: c }; }
+
+  function trimShadows(root) {
+    root.traverse(o => {
+      if (!o.isMesh || !o.castShadow) return;
+      const mat = Array.isArray(o.material) ? o.material[0] : o.material;
+      if (mat && mat.transparent && (mat.opacity == null || mat.opacity < 0.6)) { o.castShadow = false; return; }
+      const g = o.geometry; if (!g) return;
+      if (!g.boundingSphere) g.computeBoundingSphere();
+      o.getWorldScale(sv);
+      const r = g.boundingSphere ? g.boundingSphere.radius * Math.max(sv.x, sv.y, sv.z) : 1;
+      if (r < 0.18) { o.castShadow = false; return; }
+      box.setFromObject(o);
+      if (box.max.y - box.min.y < 0.04) o.castShadow = false;            // floor inlays, pads, decals
+    });
+  }
+
+  function mergeable(o) {
+    if (!o.isMesh || o.isInstancedMesh || o.isSkinnedMesh || o.children.length || !o.visible) return false;
+    const m = o.material; if (!m || Array.isArray(m) || m.transparent) return false;
+    const g = o.geometry; if (!g || !g.attributes.position || (g.morphAttributes && g.morphAttributes.position)) return false;
+    const keys = Object.keys(o.userData);
+    if (!keys.every(k => k === 'pickKind')) return false;               // colliders / overlays / anything code reads stays separate
+    if (KEEP_KINDS.has(o.userData.pickKind)) return false;
+    return true;
+  }
+
+  function merge(list) {
+    const vc = !!list[0].material.vertexColors;
+    const parts = list.map(x => { x.updateMatrix(); const g = x.geometry.index ? x.geometry.toNonIndexed() : x.geometry.clone(); g.applyMatrix4(x.matrix); if (!g.attributes.normal) g.computeVertexNormals(); return g; });
+    let n = 0; parts.forEach(g => { n += g.attributes.position.count; });
+    const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), uv = new Float32Array(n * 2), col = vc ? new Float32Array(n * 3).fill(1) : null;
+    let k = 0;
+    parts.forEach(g => {
+      const c = g.attributes.position.count;
+      pos.set(g.attributes.position.array, k * 3); nor.set(g.attributes.normal.array, k * 3);
+      if (g.attributes.uv && g.attributes.uv.itemSize === 2) uv.set(g.attributes.uv.array, k * 2);
+      if (col && g.attributes.color && g.attributes.color.itemSize === 3) col.set(g.attributes.color.array, k * 3);
+      k += c; g.dispose();
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3)); geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    if (col) geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.computeBoundingSphere(); geo.computeBoundingBox();
+    const out = new THREE.Mesh(geo, list[0].material);
+    out.castShadow = list[0].castShadow; out.receiveShadow = list[0].receiveShadow; out.renderOrder = list[0].renderOrder;
+    if (list[0].userData.pickKind) out.userData.pickKind = list[0].userData.pickKind;
+    return out;
+  }
+
+  // share identical plain materials (opaque, untextured, non-glowing) so look-alike parts can batch together;
+  // glowing / textured / transparent materials stay unique because code animates or swaps them
+  function dedupeMaterials(root, skip) {
+    const canon = new Map();
+    const sig = m => [m.type, m.color && m.color.getHexString(), m.emissive && m.emissive.getHexString(), m.emissiveIntensity, m.roughness, m.metalness, m.side, m.flatShading, m.vertexColors, m.wireframe, m.depthWrite, m.depthTest, m.polygonOffset, m.polygonOffsetFactor, m.envMap ? m.envMap.uuid : '', m.userData && m.userData.__sat ? 1 : 0].join('|');
+    const walk = (node) => {
+      if (skip.has(node)) return;
+      for (const o of node.children) {
+        if (o.isMesh && mergeable(o)) {
+          const m = o.material;
+          const glows = m.emissive && m.emissiveIntensity > 0 && (m.emissive.r + m.emissive.g + m.emissive.b) > 0.004;
+          if (!m.map && !m.alphaMap && !m.normalMap && !m.bumpMap && !glows && !m.onBeforeCompile.toString().includes('shader')) {
+            const k = sig(m); if (!canon.has(k)) canon.set(k, m); o.material = canon.get(k);
+          }
+        }
+        walk(o);
+      }
+    };
+    walk(root);
+    return canon.size;
+  }
+
+  function batch(root, skip) {
+    const walk = (node) => {
+      if (skip.has(node)) return;
+      const by = new Map();
+      for (const ch of node.children) {
+        if (!mergeable(ch)) continue;
+        const key = ch.material.uuid + '|' + ch.castShadow + '|' + ch.receiveShadow + '|' + (ch.userData.pickKind || '') + '|' + ch.renderOrder + '|' + !!ch.geometry.attributes.uv;
+        if (!by.has(key)) by.set(key, []); by.get(key).push(ch);
+      }
+      by.forEach(list => { if (list.length < 2) return; const m = merge(list); list.forEach(x => node.remove(x)); node.add(m); });
+      node.children.slice().forEach(walk);
+    };
+    walk(root);
+  }
+
+  function run() {
+    if (run.done) return; run.done = true;
+    const scene = APP.getScene(), floor = APP.getFloorData();
+    const before = Object.assign(count(scene), { building: count(floor.root).meshes });
+    trimShadows(scene);
+    const skip = new Set([...(floor.overlays || []), floor.labels].filter(Boolean));
+    dedupeMaterials(floor.root, skip);
+    batch(floor.root, skip);
+    const after = Object.assign(count(scene), { building: count(floor.root).meshes });
+    window.PERF = window.PERF || {}; window.PERF.render = { before, after };
+    console.info('perf: meshes', before.meshes, '→', after.meshes, '· shadow casters', before.shadowCasters, '→', after.shadowCasters, '· building', before.building, '→', after.building);
+  }
+  // after every 'ready' boot handler and the people fallback boot (load + 400 ms)
+  window.addEventListener('load', () => setTimeout(() => { try { run(); } catch (e) { console.error('perf trim', e); } }, 1500));
+})();
 </script>
 </body></html>
