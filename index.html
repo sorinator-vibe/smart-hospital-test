@@ -2,7 +2,7 @@
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Smart Hospital · Next-Gen Physical AI platform</title>
+<title>Smart Hospital · Robotics Intelligence Platform · Surgical floor</title>
 <script>
 /* Embedded fonts: each file is stored once and registered under every family name the page and its canvases use (CSS Font Loading API). */
 (function(){ try {
@@ -52,8 +52,8 @@ b,strong{ font-weight:700; }
 #topbar{ position:absolute; top:0; left:0; right:0; height:52px; display:flex; align-items:center; justify-content:space-between; gap:18px; padding:0 16px;
   background:rgba(255,255,255,.86); backdrop-filter:saturate(1.4) blur(14px); border-bottom:1px solid rgba(0,0,0,.08); }
 .brand{ display:flex; align-items:center; gap:11px; min-width:268px; }
-.brand-mark{ width:24px; height:24px; border-radius:7px; border:2px solid var(--tint); position:relative; background:#fff; }
-.brand-mark::after{ content:""; position:absolute; inset:6px; background:var(--tint); border-radius:2px; }
+.brand-mark{ width:30px; height:30px; border-radius:8px; background:var(--tint); color:#fff; display:grid; place-items:center; flex:none; box-shadow:0 2px 8px rgba(27,79,166,.28); }
+.brand-mark svg{ width:18px; height:18px; display:block; }
 .brand-txt{ display:flex; flex-direction:column; line-height:1.1; }
 .brand-txt strong{ font-size:13px; font-weight:700; letter-spacing:-0.01em; white-space:nowrap; color:var(--ink); }
 .brand-sub{ font-size:11.5px; color:var(--ink-2); white-space:nowrap; }
@@ -533,10 +533,10 @@ body.drill-active .fw-bar{ opacity:1; transform:translateX(-50%) translateY(0); 
     <!-- top bar -->
     <header id="topbar">
       <div class="brand">
-        <span class="brand-mark"></span>
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.6"></circle><circle cx="5.5" cy="6" r="1.8"></circle><circle cx="18.5" cy="6" r="1.8"></circle><circle cx="5.5" cy="18" r="1.8"></circle><circle cx="18.5" cy="18" r="1.8"></circle><path d="M7 7.4l3 2.9M17 7.4l-3 2.9M7 16.6l3-2.9M17 16.6l-3-2.9"></path></svg></span>
         <div class="brand-txt">
           <strong>Robotics Intelligence Platform</strong>
-          <span class="brand-sub">Smart hospital, surgical floor, level 4</span>
+          <span class="brand-sub">Smart hospital · Surgical floor, level 4</span>
         </div>
       </div>
 
@@ -690,7 +690,7 @@ body.drill-active .fw-bar{ opacity:1; transform:translateX(-50%) translateY(0); 
               <path class="io-body" d="M131 93c0-5.3 4-8.8 9-8.8s9 3.5 9 8.8z"></path>
             </g>
           </svg>
-          <span class="info-eyebrow">The North Star</span>
+          <span class="info-eyebrow">Robotics Intelligence Platform (PRIOR) · The North Star</span>
           <h2 class="info-h">A hospital that anticipates, orchestrates, and cares — where the needs of the patient come first, always.</h2>
         </div>
         <p class="info-lead">We will build the world’s first <b>category-of-one smart hospital</b>: not technology bolted onto care, but a single living system. The floor senses. The fleet responds. The intelligence reasons. The clinician connects. Care stops being a relay of hand-offs and becomes one seamless, anticipatory act — so no one waits, no one is confused, and no one feels alone.</p>
@@ -6353,7 +6353,7 @@ window.APP = (function () {
     const rc = recov.reduce((m, r) => (m[r.status] = (m[r.status] || 0) + 1, m), {});
     const body = document.getElementById('opsBody');
     body.innerHTML = `
-      <a class="ops-explore" href="https://sorinator-vibe.github.io/smart-hospital-spd/" target="_blank" rel="noopener noreferrer">Explore <b>Sterile Processing Physical AI</b></a>
+      <a class="ops-explore" href="https://sorinator-vibe.github.io/smart-hospital-spd/" target="_blank" rel="noopener noreferrer">Switch to <b>sterile processing view</b></a>
       <div class="kpis">
         <div class="kpi"><div class="v">${counts['in-surgery'] || 0}<small>/${ors.length}</small></div><div class="l">In surgery</div></div>
         <div class="kpi"><div class="v">88<small>%</small></div><div class="l">Utilization</div></div>
